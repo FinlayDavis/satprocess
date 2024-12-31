@@ -115,15 +115,20 @@ def process_and_align_images(folder_path, shifts_file, default_file = 0):
             file_centroid = file_circles[0][:2]
             shift_x = ref_centroid[0] - file_centroid[0]
             shift_y = ref_centroid[1] - file_centroid[1]
+            shifts[file] = (shift_y, shift_x)
         
         aligned_image = alignImages(file_array, shift_y, shift_x)
         aligned_images.append((file, aligned_image))
     
+    # save the shifting values for the future
+    save_shifts(shifts_file, shifts)
+
     return aligned_images
 
 # Example usage
 folder_path = 'TestImages'
-aligned_images = process_and_align_images(folder_path)
+shifts_file = 'shifts.csv'
+aligned_images = process_and_align_images(folder_path, shifts_file)
 
 # Visualize the aligned results
 fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
