@@ -81,9 +81,11 @@ def alignImages(dynArray: np.ndarray, shift_x, shift_y):
     alignedArray = sp.shift(dynArray, shift=[shift_y, shift_x], mode="nearest")
     return alignedArray
 
-def process_and_align_images(folder_path: str, shifts_file: str, save_folder: str, default_file: int = 0):
+def process_and_align_images(folder_path: str, shifts_file: str, save_folder: str, original_folder: str, default_file: int = 0):
     if not os.path.exists(save_folder): 
         os.makedirs(save_folder) 
+    if not os.path.exists(original_folder): 
+        os.makedirs(original_folder) 
 
     files = [f for f in os.listdir(folder_path) if f.endswith('.fits')]  # Adjust extensions as needed
     
@@ -110,8 +112,10 @@ def process_and_align_images(folder_path: str, shifts_file: str, save_folder: st
     aligned_images = []
 
     save_path = os.path.join(save_folder, ref_file)
-
     save_aligned_images(ref_file, ref_array, save_path)
+    misaligned_save_path = os.path.join(original_folder, f"{os.path.splitext(ref_file)[0]}_misaligned.png")
+    plt.imsave(misaligned_save_path, ref_array, cmap='gray')
+
     aligned_images.append((ref_file, ref_array))
     
     # Process and align all images
@@ -120,6 +124,9 @@ def process_and_align_images(folder_path: str, shifts_file: str, save_folder: st
         file_array = circleIdentify(file_path)
         file_edges = preprocess(file_array)
         
+        misaligned_save_path = os.path.join(original_folder, f"{os.path.splitext(file)[0]}_misaligned.png")
+        plt.imsave(misaligned_save_path, file_array, cmap='gray')
+
         # Check if file has already been processed
         if file in shifts:
             shift_x, shift_y = shifts[file]
@@ -186,10 +193,11 @@ def create_slideshow(images, interval=1000):
     plt.show()
 
 # Example usage
-folder_path = 'TestImages'
+folder_path = 'TestImages2'
 shifts_file = folder_path + '/shifts.csv'
 save_folder = folder_path + '/alignedImages'
-aligned_images = process_and_align_images(folder_path, shifts_file, save_folder)
+original_folder = folder_path + '/unprocessedImages'
+aligned_images = process_and_align_images(folder_path, shifts_file, save_folder, original_folder)
 
 # Example usage
 aligned_images = load_aligned_images(save_folder)
