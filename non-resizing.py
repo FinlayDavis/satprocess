@@ -127,7 +127,8 @@ def process_and_align_images(folder_path, shifts_file, default_file = 0):
 
 # Example usage
 folder_path = 'TestImages'
-shifts_file = 'shifts.csv'
+shifts_file = folder_path + '/shifts.csv'
+print(shifts_file)
 aligned_images = process_and_align_images(folder_path, shifts_file)
 
 # Visualize the aligned results
