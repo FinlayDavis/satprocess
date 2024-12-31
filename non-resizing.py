@@ -28,10 +28,9 @@ def load_shifts(file_path):
         pass  # No shifts file exists yet
     return shifts
 
-
 def circleIdentify(filename: str):
     # Load file from documents
-    #filepath1 = "RSM20241001T013504_0002_HA.fits"
+    # filepath1 = "RSM20241001T013504_0002_HA.fits"
 
     with fits.open(filename) as hdul:
         data = hdul[1].data
@@ -71,7 +70,6 @@ def houghTransform(edges: np.ndarray, array: np.ndarray):
     accums, cx, cy, radii = hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
 
     circles = np.array(list(zip(cx, cy, radii)))
-    print(type(circles))
     return circles
 # rename circles to be clearer
 
@@ -82,8 +80,11 @@ def alignImages(dynArray: np.ndarray, shift_x, shift_y):
     alignedArray = sp.shift(dynArray, shift=[shift_y, shift_x], mode="nearest")
     return alignedArray
 
-def process_and_align_images(folder_path, shifts_file, default_file = 0):
-    files = [f for f in os.listdir(folder_path) if f.endswith('.fits') or f.endswith('.jpg')]  # Adjust extensions as needed
+def process_and_align_images(folder_path: str, shifts_file: str, save_folder: str, default_file: int = 0):
+    if not os.path.exists(save_folder): 
+        os.makedirs(save_folder) 
+
+    files = [f for f in os.listdir(folder_path) if f.endswith('.fits')]  # Adjust extensions as needed
     
     if not files:
         raise ValueError("No image files found in the folder.")
@@ -94,15 +95,21 @@ def process_and_align_images(folder_path, shifts_file, default_file = 0):
     # Read the first image as the reference
     ref_file = files[default_file]
     ref_path = os.path.join(folder_path, ref_file)
-    ref_array = circleIdentify(ref_path)
-    ref_edges = preprocess(ref_array)
-    ref_circles = houghTransform(ref_edges, ref_array)
-    ref_centroid = ref_circles[0][:2]
+
+    if ref_file in shifts:
+        ref_shift_x, ref_shift_y = shifts[ref_file]
+        ref_centroid = (ref_shift_x, ref_shift_y)
+    else:   
+        ref_array = circleIdentify(ref_path)
+        ref_edges = preprocess(ref_array)
+        ref_circles = houghTransform(ref_edges, ref_array)
+        ref_centroid = ref_circles[0][:2]
+        shifts[ref_file] = (ref_centroid[1], ref_centroid[0])
     
     aligned_images = []
     
     # Process and align all images
-    for file in files:
+    for file in files[1:]: # Skip the first file as it's the reference file
         file_path = os.path.join(folder_path, file)
         file_array = circleIdentify(file_path)
         file_edges = preprocess(file_array)
@@ -118,9 +125,27 @@ def process_and_align_images(folder_path, shifts_file, default_file = 0):
             shifts[file] = (shift_y, shift_x)
         
         aligned_image = alignImages(file_array, shift_y, shift_x)
+
+        save_path = os.path.join(save_folder, file)
+
+        # Save new arrays as .fits data
+        fits.writeto(save_path, aligned_image, overwrite=True)
+
+        # Save a .png of the figure
+        fig, ax = plt.subplots()
+        ax.imshow(aligned_image, cmap='gray')
+        ax.set_title(file)
+        ax.axis('off')
+        fig_save_path = os.path.join(save_folder, f"{os.path.splitext(file)[0]}.png")
+        fig.savefig(fig_save_path)
+        plt.close(fig)
+
         aligned_images.append((file, aligned_image))
     
-    # save the shifting values for the future
+    # Include ref file in aligned resulrs
+    aligned_images.insert(0, (ref_file, plt.imread(ref_path)))
+
+    # Save the shifting values for the future
     save_shifts(shifts_file, shifts)
 
     return aligned_images
@@ -128,25 +153,13 @@ def process_and_align_images(folder_path, shifts_file, default_file = 0):
 # Example usage
 folder_path = 'TestImages'
 shifts_file = folder_path + '/shifts.csv'
-print(shifts_file)
-aligned_images = process_and_align_images(folder_path, shifts_file)
+save_folder = folder_path + '/alignedImages'
+aligned_images = process_and_align_images(folder_path, shifts_file, save_folder)
 
-# Visualize the aligned results
-fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
-for ax, (file, aligned_image) in zip(axes, aligned_images):
-    ax.imshow(aligned_image, cmap='gray')
-    ax.set_title(file)
-    ax.axis('off')
-plt.show()
-
-
-
-# image1array = circleIdentify("RSM20241001T013504_0002_HA.fits")
-# image1data = preprocess(image1array)
-
-# image2array = circleIdentify("RSM20241001T013616_0003_HA.fits")
-# image2data = preprocess(image2array)
-
-# newarray = transformDynArray(image1data, image2array, image2data)
-# image3data = preprocess(newarray)
-# print(image3data)
+# # Visualize the aligned results
+# fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
+# for ax, (file, aligned_image) in zip(axes, aligned_images):
+#     ax.imshow(aligned_image, cmap='gray')
+#     ax.set_title(file)
+#     ax.axis('off')
+# plt.show()
