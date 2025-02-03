@@ -6,4 +6,4 @@ This project requires external libraries - to avoid any conflicts, it is best to
 To setup the dependencies, use '''pip install -r requirements.txt'''.
 
 For aligning an image, the code will look for a folder with CHASE satellite data, downloaded from https://ssdc.nju.edu.cn/NdchaseSatellite.
-Currently, this is setup to look for /TestImages, although this can be reconfigured.
+Currently, this is setup to look for /TestImages, although this can be reconfigured. Simply change the variable "folder_path" in main.
