@@ -5,29 +5,43 @@ import scipy.ndimage as sp
 from skimage.transform import hough_circle, hough_circle_peaks
 from skimage.feature import canny
 from skimage.filters import threshold_otsu
+import tkinter as tk 
+from tkinter import *
+from PIL import Image 
+from PIL import ImageTk 
 import os
 import csv
 
 def save_shifts(file_path, shifts):
-    with open(file_path, mode='w', newline='') as file:
-        writer = csv.writer(file)
-        writer.writerow(['filename', 'shift_y', 'shift_x'])
-        for filename, (shift_y, shift_x) in shifts.items():
-            writer.writerow([filename, shift_y, shift_x])
+    """Save alignment shifts to CSV with directory creation"""
+    directory = os.path.dirname(file_path)
+    if directory:  # Only create if path contains directories
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(file_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['filename', 'shift_y', 'shift_x'])
+            for filename, (shift_y, shift_x) in shifts.items():
+                writer.writerow([filename, shift_y, shift_x])
+    except IOError as e:
+        print(f"Error saving shifts: {str(e)}")
+
 
 def load_shifts(file_path):
+    """Load existing shifts with error handling"""
     shifts = {}
     try:
-        with open(file_path, mode='r') as file:
-            reader = csv.reader(file)
-            next(reader)  # Skip the header
-            for row in reader:
-                filename, shift_y, shift_x = row
-                shifts[filename] = (float(shift_y), float(shift_x))
-    except FileNotFoundError:
-        pass  # No shifts file exists yet
+        if os.path.exists(file_path):
+            with open(file_path, mode='r') as file:
+                reader = csv.reader(file)
+                next(reader)  # Skip header
+                for row in reader: 
+                    if len(row) >= 3:
+                        filename, shift_y, shift_x = row[0], float(row[1]), float(row[2])
+                        shifts[filename] = (shift_y, shift_x)
+    except Exception as e:
+        print(f"Warning: Error loading shifts - {str(e)}")
     return shifts
-
 
 def circleIdentify(filename: str):
     # Load file from documents
@@ -43,9 +57,6 @@ def circleIdentify(filename: str):
     return array
    
 
-
-# Explain Gaussian blur, thresholding and Canny edge map
-
 def preprocess(image_array: np.ndarray):
 
     # Apply Gaussian blur 
@@ -59,8 +70,6 @@ def preprocess(image_array: np.ndarray):
     edges = canny(binary, sigma=1)
     return edges
 
-
-# How does the Hough transform work?
 
 def houghTransform(edges: np.ndarray, array: np.ndarray):
     # Perform Circular Hough Transform for large circles
@@ -125,28 +134,23 @@ def process_and_align_images(folder_path, shifts_file, default_file = 0):
 
     return aligned_images
 
-# Example usage
-folder_path = 'TestImages'
-shifts_file = folder_path + '/shifts.csv'
-print(shifts_file)
-aligned_images = process_and_align_images(folder_path, shifts_file)
 
-# Visualize the aligned results
-fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
-for ax, (file, aligned_image) in zip(axes, aligned_images):
-    ax.imshow(aligned_image, cmap='gray')
-    ax.set_title(file)
-    ax.axis('off')
-plt.show()
-
-
-
-# image1array = circleIdentify("RSM20241001T013504_0002_HA.fits")
-# image1data = preprocess(image1array)
-
-# image2array = circleIdentify("RSM20241001T013616_0003_HA.fits")
-# image2data = preprocess(image2array)
-
-# newarray = transformDynArray(image1data, image2array, image2data)
-# image3data = preprocess(newarray)
-# print(image3data)
+if __name__ == "__main__":
+    folder_path = 'TestImages'
+    shifts_file = os.path.join(folder_path, 'shifts.csv')
+    
+    try:
+        aligned_images = process_and_align_images(folder_path, shifts_file)
+        
+        if not aligned_images:
+            print("No images processed successfully")
+        else:
+            fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
+            for ax, (file, aligned_image) in zip(axes, aligned_images):
+                ax.imshow(aligned_image, cmap='gray')
+                ax.set_title(file)
+                ax.axis('off')
+            plt.show()
+            
+    except Exception as e:
+        print(f"Critical error: {str(e)}")
