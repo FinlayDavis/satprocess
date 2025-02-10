@@ -14,11 +14,11 @@ import csv
 
 def save_shifts(file_path: str, shifts: csv):
     """
-    Save alignment shifts to CSV with directory creation
+    Save alignment shifts to CSV with directory creation.
 
     Args:
-        file_path (str): Folder location to save the .csv file in
-        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference
+        file_path (str): Folder location to save the .csv file in.
+        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference.
     """
     directory = os.path.dirname(file_path)
     if directory:  # Only create if path contains directories
@@ -33,15 +33,15 @@ def save_shifts(file_path: str, shifts: csv):
         print(f"Error saving shifts: {str(e)}")
 
 
-def load_shifts(file_path:str) -> dict:
+def load_shifts(file_path: str) -> dict:
     """
     Load existing shifts with error handling
 
     Args:
-        file_path (str): _description_
+        file_path (str): Location of the shift.csv file.
 
     Returns:
-        dict: _description_
+        dict: The x/y shift values.
     """
     shifts = {}
     try:
@@ -110,10 +110,10 @@ def preprocess(image_array: np.ndarray)-> np.ndarray:
     Preprocessing a 2D image array so it is easier for the Hough transform to identify features.
 
     Args:
-        image_array (np.ndarray): 2D image array to be processed
+        image_array (np.ndarray): The 2D image array to be processed.
 
     Returns:
-        np.ndarray: The processed image
+        np.ndarray: The processed image.
     """
     # Apply Gaussian blur 
     blurred = sp.gaussian_filter(image_array, sigma=2) 
@@ -155,25 +155,25 @@ def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int)-> np.ndarr
     Transforms the inputted array by an x and y value.
 
     Args:
-        dynArray (np.ndarray): The dynamic array to be transformed
-        shift_x (int): The x transform
-        shift_y (int): The y transform
+        dynArray (np.ndarray): The dynamic array to be transformed.
+        shift_x (int): The x transform.
+        shift_y (int): The y transform.
 
     Returns:
-        np.ndarray: The transformed array
+        np.ndarray: The transformed array.
     """
     # Transform the image by the differece, to align images.
     alignedArray = sp.shift(dynArray, shift=[shift_y, shift_x], mode="nearest")
     return alignedArray
 
 
-def spatial_calibration(folder_path: str, wavelength: int, shifts_file: str = 'shifts.csv', default_file:int = 0, minrad: int = 800, maxrad: int = 1000):
+def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str = 'shifts.csv', default_file:int = 0, minrad: int = 800, maxrad: int = 1000):
     """
     Main processing pipeline with validation
 
     Args:
-        folder_path (str): The name of the folder which holds the .fits files
-        wavelength (int): _description_
+        folder_path (str): The name of the folder which holds the .fits files.
+        wavelength (int): .fits files 3 axes, with the z axis being wavelength. This allows the user to choose which wavelenth. Defaults to 1.
         shifts_file (str, optional): The name of the .csv file which stores the spatial offset values for each .fits file. Defaults to 'shifts.csv'.
         default_file (int, optional): The file number which is used as the reference. Defaults to 0 (first file in the folder).
         minrad (int, optional): Minumum radius of indentified circles. Defaults to 800.
