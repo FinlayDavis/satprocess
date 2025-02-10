@@ -12,8 +12,14 @@ from PIL import ImageTk
 import os
 import csv
 
-def save_shifts(file_path, shifts):
-    """Save alignment shifts to CSV with directory creation"""
+def save_shifts(file_path: str, shifts: csv):
+    """
+    Save alignment shifts to CSV with directory creation
+
+    Args:
+        file_path (str): Folder location to save the .csv file in
+        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference
+    """
     directory = os.path.dirname(file_path)
     if directory:  # Only create if path contains directories
         os.makedirs(directory, exist_ok=True)
@@ -27,8 +33,16 @@ def save_shifts(file_path, shifts):
         print(f"Error saving shifts: {str(e)}")
 
 
-def load_shifts(file_path):
-    """Load existing shifts with error handling"""
+def load_shifts(file_path:str) -> dict:
+    """
+    Load existing shifts with error handling
+
+    Args:
+        file_path (str): _description_
+
+    Returns:
+        dict: _description_
+    """
     shifts = {}
     try:
         if os.path.exists(file_path):
@@ -43,22 +57,64 @@ def load_shifts(file_path):
         print(f"Warning: Error loading shifts - {str(e)}")
     return shifts
 
-def circleIdentify(filename: str):
-    # Load file from documents
-    #filepath1 = "RSM20241001T013504_0002_HA.fits"
+def load_2D_array(filename: str, wavelength: int) -> np.ndarray:
+    """
+    Loads a single wavelength of the specified .fits file to an array.
 
-    with fits.open(filename) as hdul:
-        data = hdul[1].data
-        # print(data.shape) # Print the shape of the compressed image data
-        # Store the 70th row as a 2D array
-        array = data[40, :, :]
-        # print(array.shape)  # should be 2313 by 2304 array
+    Args:
+        filename (str): The name of the .fits file to be loaded.
+        wavelength (int): The index of the wavelength to extract.
+
+    Returns:
+        np.ndarray: A 2D array of the solar image at the specified wavelength.
+
+    Raises:
+        FileNotFoundError: If the specified file does not exist.
+        ValueError: If the specified wavelength is out of bounds.
+        IndexError: If the .fits file does not have the expected 3D structure.
+    """
+    # Check if the file exists
+    if not os.path.isfile(filename):
+        raise FileNotFoundError(f"The file {filename} does not exist.")
     
-    return array
-   
+    try:
+        with fits.open(filename) as hdul:
+            # Ensure the file has the expected structure
+            if len(hdul) < 2:
+                raise IndexError("The .fits file does not contain the expected data extension.")
+            
+            data = hdul[1].data
+            
+            # Check if the data is 3D
+            if data.ndim != 3:
+                raise IndexError("The .fits file data is not 3D (expected [wavelength, x, y]).")
+            
+            # Check if the wavelength index is valid
+            if wavelength < 0 or wavelength >= data.shape[0]:
+                raise ValueError(
+                    f"Wavelength index {wavelength} is out of bounds. "
+                    f"Valid range is 0 to {data.shape[0] - 1}."
+                )
+            
+            # Extract the specified wavelength
+            array = data[wavelength, :, :]
+            return array
+    
+    except Exception as e:
+        # Catch any unexpected errors and re-raise with context
+        raise RuntimeError(f"An error occurred while processing {filename}: {str(e)}")
+    
 
-def preprocess(image_array: np.ndarray):
+def preprocess(image_array: np.ndarray)-> np.ndarray:
+    """
+    Preprocessing a 2D image array so it is easier for the Hough transform to identify features.
 
+    Args:
+        image_array (np.ndarray): 2D image array to be processed
+
+    Returns:
+        np.ndarray: The processed image
+    """
     # Apply Gaussian blur 
     blurred = sp.gaussian_filter(image_array, sigma=2) 
 
@@ -71,86 +127,230 @@ def preprocess(image_array: np.ndarray):
     return edges
 
 
-def houghTransform(edges: np.ndarray, array: np.ndarray):
+def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000)-> np.ndarray:
+    """
+    Performs the circular hough transform on the inputted 2D array, looking for circles in the specified size range.
+
+    Args:
+        edges (np.ndarray): The 2D array containing the image data
+        minrad (int, optional): Minumum radius of indentified circles. Defaults to 800.
+        maxrad (int, optional): Maximum radius of indentified circles. Defaults to 1000.
+
+    Returns:
+        np.ndarray: An array containing all the found circles (hopefully just the one)
+    """
     # Perform Circular Hough Transform for large circles
-    hough_radii = np.arange(800, 1000, 1)  # Look for circle radii in the range 800-1000 (in the array, the radius of the sun is 925 for this file), with a step size of 3
+    hough_radii = np.arange(minrad, maxrad, 1)  # Look for circle radii in the range 800-1000 (in the array, the radius of the sun is 925 for this file), with a step size of 3
     hough_res = hough_circle(edges, hough_radii)
 
     # Identify circles
     accums, cx, cy, radii = hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
 
-    circles = np.array(list(zip(cx, cy, radii)))
-    print(type(circles))
-    return circles
-# rename circles to be clearer
+    identifiedCircles = np.array(list(zip(cx, cy, radii)))
+    return identifiedCircles
 
-# Transforming the second image to be lined up with the first
 
-def alignImages(dynArray: np.ndarray, shift_x, shift_y):
+def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int)-> np.ndarray:
+    """
+    Transforms the inputted array by an x and y value.
+
+    Args:
+        dynArray (np.ndarray): The dynamic array to be transformed
+        shift_x (int): The x transform
+        shift_y (int): The y transform
+
+    Returns:
+        np.ndarray: The transformed array
+    """
     # Transform the image by the differece, to align images.
     alignedArray = sp.shift(dynArray, shift=[shift_y, shift_x], mode="nearest")
     return alignedArray
 
-def process_and_align_images(folder_path, shifts_file, default_file = 0):
-    files = [f for f in os.listdir(folder_path) if f.endswith('.fits') or f.endswith('.jpg')]  # Adjust extensions as needed
+
+def spatial_calibration(folder_path: str, wavelength: int, shifts_file: str = 'shifts.csv', default_file:int = 0, minrad: int = 800, maxrad: int = 1000):
+    """
+    Main processing pipeline with validation
+
+    Args:
+        folder_path (str): The name of the folder which holds the .fits files
+        wavelength (int): _description_
+        shifts_file (str, optional): The name of the .csv file which stores the spatial offset values for each .fits file. Defaults to 'shifts.csv'.
+        default_file (int, optional): The file number which is used as the reference. Defaults to 0 (first file in the folder).
+        minrad (int, optional): Minumum radius of indentified circles. Defaults to 800.
+        maxrad (int, optional): Maximum radius of indentified circles. Defaults to 1000.
+
+    Raises:
+        ValueError: Error raised if the file path doesn't exist (or isn't referenced properly)
+        RuntimeError: Error raised if the specified file path cannot be accessed
+        ValueError: Error raised if there are no files with the correct file extension at the location
+        ValueError: Error raised if the user specified "default file" is a number higher than the number of files
+        RuntimeError: Error raised if the reference file cannot be processed.
+    """
+
+    # Validate input directory
+    if not os.path.isdir(folder_path):
+        raise ValueError(f"Directory {folder_path} not found")
+    
+    # Get files with multiple validation checks
+    try:
+        files = [f for f in os.listdir(folder_path) 
+                if f.lower().endswith(('.fits', '.jpg'))]
+    except Exception as e:
+        raise RuntimeError(f"Error accessing directory: {str(e)}")  
     
     if not files:
-        raise ValueError("No image files found in the folder.")
-    
-    # Load any cached transform values 
-    shifts = load_shifts(shifts_file)
+        raise ValueError("No valid image files found")
+    if default_file >= len(files):
+        raise ValueError("Invalid default file index")
 
-    # Read the first image as the reference
-    ref_file = files[default_file]
-    ref_path = os.path.join(folder_path, ref_file)
-    ref_array = circleIdentify(ref_path)
-    ref_edges = preprocess(ref_array)
-    ref_circles = houghTransform(ref_edges, ref_array)
-    ref_centroid = ref_circles[0][:2]
-    
+    shifts = load_shifts(shifts_file)
     aligned_images = []
-    
-    # Process and align all images
+
+    # Process reference image
+    try:
+        ref_file = files[default_file]
+        ref_path = os.path.join(folder_path, ref_file)
+        ref_array = load_2D_array(ref_path, wavelength)
+        ref_edges = preprocess(ref_array)
+        ref_circles = hough_transform(ref_edges, minrad, maxrad)
+        ref_centroid = ref_circles[0][:2]
+    except Exception as e:
+        raise RuntimeError(f"Reference processing failed: {str(e)}")
+
+    # Process all files
     for file in files:
         file_path = os.path.join(folder_path, file)
-        file_array = circleIdentify(file_path)
-        file_edges = preprocess(file_array)
-        
-        # Check if file has already been processed
-        if file in shifts:
-            shift_x, shift_y = shifts[file]
-        else:
-            file_circles = houghTransform(file_edges, file_array)
-            file_centroid = file_circles[0][:2]
-            shift_x = ref_centroid[0] - file_centroid[0]
-            shift_y = ref_centroid[1] - file_centroid[1]
-            shifts[file] = (shift_y, shift_x)
-        
-        aligned_image = alignImages(file_array, shift_y, shift_x)
-        aligned_images.append((file, aligned_image))
-    
-    # save the shifting values for the future
-    save_shifts(shifts_file, shifts)
+        try:
+            # Validate and load file
+            if not os.path.isfile(file_path):
+                print(f"Skipping missing file: {file}")
+                continue
 
+            file_array = load_2D_array(file_path, wavelength)
+            file_edges = preprocess(file_array)
+
+            # Calculate or load shifts
+            if file in shifts:
+                shift_y, shift_x = shifts[file]
+            else:
+                file_circles = hough_transform(file_edges, minrad, maxrad)
+                file_centroid = file_circles[0][:2]   
+                shift_x = ref_centroid[0] - file_centroid[0]
+                shift_y = ref_centroid[1] - file_centroid[1]
+                shifts[file] = (shift_y, shift_x)
+
+            # Align and store
+            aligned = transform_array(file_array, *shifts[file])
+            aligned_images.append((file, aligned))
+            
+        except Exception as e:
+            print(f"Skipping {file} due to error: {str(e)}")
+            continue
+
+    # Save results
+    try:
+        print(type(shifts))
+        save_shifts(shifts_file, shifts)
+    except Exception as e:
+        print(f"Warning: Failed to save shifts - {str(e)}")
+
+    print(type(aligned_images))
     return aligned_images
+
+
+def extract_centered_region(input_array: np.ndarray, output_size: tuple = (100, 100)) -> np.ndarray:
+    """
+    Extracts a centered region of the specified size from the input array.
+
+    Args:
+        input_array (np.ndarray): The input array (2D or higher).
+        output_size (tuple): The desired size of the output region (height, width). Default is (100, 100).
+
+    Returns:
+        np.ndarray: A new array of the specified size, centered at the middle of the input array.
+
+    Raises:
+        ValueError: If the input array is not 2D or if the output size is larger than the input array.
+    """
+    # Ensure the input array is 2D
+    if input_array.ndim != 2:
+        raise ValueError("Input array must be 2D.")
+    
+    # Get the dimensions of the input array
+    input_height, input_width = input_array.shape
+    
+    # Get the desired output dimensions
+    output_height, output_width = output_size
+    
+    # Check if the output size is larger than the input array
+    if output_height > input_height or output_width > input_width:
+        raise ValueError("Output size cannot be larger than the input array dimensions.")
+    
+    # Calculate the center of the input array
+    center_y = input_height // 2
+    center_x = input_width // 2
+    
+    # Calculate the starting and ending indices for the centered region
+    start_y = center_y - output_height // 2
+    end_y = start_y + output_height
+    start_x = center_x - output_width // 2
+    end_x = start_x + output_width
+    
+    # Handle edge cases where the region goes out of bounds
+    if start_y < 0:
+        start_y = 0
+        end_y = output_height
+    if start_x < 0:
+        start_x = 0
+        end_x = output_width
+    if end_y > input_height:
+        start_y = input_height - output_height
+        end_y = input_height
+    if end_x > input_width:
+        start_x = input_width - output_width
+        end_x = input_width
+    
+    # Extract the centered region
+    centered_region = input_array[start_y:end_y, start_x:end_x]
+    
+    return centered_region
+
+### Test Usage - how a user might interact with this package
 
 
 if __name__ == "__main__":
     folder_path = 'TestImages'
-    shifts_file = os.path.join(folder_path, 'shifts.csv')
+    shifts_file_name = 'shifts.csv'
+    shifts_file = os.path.join(folder_path, shifts_file_name)
     
     try:
-        aligned_images = process_and_align_images(folder_path, shifts_file)
+ 
+        aligned_images = spatial_calibration(folder_path, 40, shifts_file, 0, 800, 1000)
         
         if not aligned_images:
             print("No images processed successfully")
         else:
-            fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
-            for ax, (file, aligned_image) in zip(axes, aligned_images):
+            # Handle single image case
+            if len(aligned_images) == 1:
+                fig, ax = plt.subplots(figsize=(6, 6))  # Single subplot
+                file, aligned_image = aligned_images[0]
                 ax.imshow(aligned_image, cmap='gray')
                 ax.set_title(file)
                 ax.axis('off')
+            else:
+                # Multiple subplots for multiple images
+                fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
+                for ax, (file, aligned_image) in zip(axes, aligned_images):
+                    ax.imshow(aligned_image, cmap='gray')
+                    ax.set_title(file)
+                    ax.axis('off')
             plt.show()
             
+    
+
     except Exception as e:
         print(f"Critical error: {str(e)}")
+
+    central_pixels = extract_centered_region()
+
+
