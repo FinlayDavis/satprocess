@@ -12,27 +12,6 @@ from PIL import ImageTk
 import os
 import csv
 
-def save_shifts(file_path: str, shifts: csv):
-    """
-    Save alignment shifts to CSV with directory creation.
-
-    Args:
-        file_path (str): Folder location to save the .csv file in.
-        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference.
-    """
-    directory = os.path.dirname(file_path)
-    if directory:  # Only create if path contains directories
-        os.makedirs(directory, exist_ok=True)
-    try:
-        with open(file_path, mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(['filename', 'shift_y', 'shift_x'])
-            for filename, (shift_y, shift_x) in shifts.items():
-                writer.writerow([filename, shift_y, shift_x])
-    except IOError as e:
-        print(f"Error saving shifts: {str(e)}")
-
-
 def load_shifts(file_path: str) -> dict:
     """
     Load existing shifts with error handling
@@ -56,6 +35,7 @@ def load_shifts(file_path: str) -> dict:
     except Exception as e:
         print(f"Warning: Error loading shifts - {str(e)}")
     return shifts
+
 
 def load_2D_array(filename: str, wavelength: int) -> np.ndarray:
     """
@@ -103,7 +83,28 @@ def load_2D_array(filename: str, wavelength: int) -> np.ndarray:
     except Exception as e:
         # Catch any unexpected errors and re-raise with context
         raise RuntimeError(f"An error occurred while processing {filename}: {str(e)}")
-    
+
+
+def save_shifts(file_path: str, shifts: csv):
+    """
+    Save alignment shifts to CSV with directory creation.
+
+    Args:
+        file_path (str): Folder location to save the .csv file in.
+        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference.
+    """
+    directory = os.path.dirname(file_path)
+    if directory:  # Only create if path contains directories
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(file_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(['filename', 'shift_y', 'shift_x'])
+            for filename, (shift_y, shift_x) in shifts.items():
+                writer.writerow([filename, shift_y, shift_x])
+    except IOError as e:
+        print(f"Error saving shifts: {str(e)}")
+
 
 def preprocess(image_array: np.ndarray)-> np.ndarray:
     """
@@ -167,7 +168,7 @@ def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int)-> np.ndarr
     return alignedArray
 
 
-def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str = 'shifts.csv', default_file:int = 0, minrad: int = 800, maxrad: int = 1000):
+def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str = 'shifts.csv', default_file: int = 0, minrad: int = 800, maxrad: int = 1000):
     """
     Main processing pipeline with validation
 
@@ -178,6 +179,9 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
         default_file (int, optional): The file number which is used as the reference. Defaults to 0 (first file in the folder).
         minrad (int, optional): Minumum radius of indentified circles. Defaults to 800.
         maxrad (int, optional): Maximum radius of indentified circles. Defaults to 1000.
+
+    Returns:
+        list: A list containing the transformed images
 
     Raises:
         ValueError: Error raised if the file path doesn't exist (or isn't referenced properly)
@@ -190,6 +194,10 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
     # Validate input directory
     if not os.path.isdir(folder_path):
         raise ValueError(f"Directory {folder_path} not found")
+    
+    # Create the AlignedImages subfolder if it doesn't exist
+    aligned_folder = os.path.join(folder_path, "AlignedImages")
+    os.makedirs(aligned_folder, exist_ok=True)
     
     # Get files with multiple validation checks
     try:
@@ -242,6 +250,12 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
             # Align and store
             aligned = transform_array(file_array, *shifts[file])
             aligned_images.append((file, aligned))
+
+            # Save the aligned image as a new FITS file in the AlignedImages subfolder
+            if file.lower().endswith('.fits'):
+                new_file_name = f"{os.path.splitext(file)[0]}_aligned.fits"
+                new_file_path = os.path.join(aligned_folder, new_file_name)
+                save_aligned_fits(file_path, new_file_path, aligned, shift_x, shift_y)
             
         except Exception as e:
             print(f"Skipping {file} due to error: {str(e)}")
@@ -249,14 +263,36 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
 
     # Save results
     try:
-        print(type(shifts))
         save_shifts(shifts_file, shifts)
     except Exception as e:
         print(f"Warning: Failed to save shifts - {str(e)}")
 
-    print(type(aligned_images))
     return aligned_images
 
+def save_aligned_fits(original_path: str, new_path: str, aligned_data, shift_x: float, shift_y: float):
+    """
+    Save the aligned data as a new FITS file with updated header information.
+
+    Args:
+        original_path (str): Path to the original FITS file.
+        new_path (str): Path to save the new aligned FITS file.
+        aligned_data: The aligned image data.
+        shift_x (float): The x-axis shift applied.
+        shift_y (float): The y-axis shift applied.
+    """
+    # Read the original FITS file
+    with fits.open(original_path) as hdul:
+        # Update the header with the shift information
+        hdul[0].header['SHIFT_X'] = (shift_x, 'X-axis shift applied during alignment')
+        hdul[0].header['SHIFT_Y'] = (shift_y, 'Y-axis shift applied during alignment')
+        
+        # Replace the data with the aligned data
+        hdul[0].data = aligned_data
+        
+        # Save the new FITS file
+        hdul.writeto(new_path, overwrite=True)
+
+    
 
 def extract_centered_region(input_array: np.ndarray, output_size: tuple = (100, 100)) -> np.ndarray:
     """
@@ -315,42 +351,95 @@ def extract_centered_region(input_array: np.ndarray, output_size: tuple = (100, 
     
     return centered_region
 
-### Test Usage - how a user might interact with this package
+def analyze_aligned_images(folder_path: str, output_size: tuple = (100, 100)):
+    """
+    Loads the aligned .fits files from the AlignedImages subfolder, extracts the centered region,
+    orders the pixels by intensity, and retrieves the coordinates of the median 10%.
 
+    Args:
+        folder_path (str): The path to the folder containing the original and aligned images.
+        output_size (tuple): The size of the centered region to extract. Default is (100, 100).
+    """
+    # Path to the AlignedImages subfolder
+    aligned_folder = os.path.join(folder_path, "AlignedImages")
+    
+    # Check if the AlignedImages folder exists
+    if not os.path.isdir(aligned_folder):
+        raise ValueError(f"AlignedImages folder not found in {folder_path}")
+    
+    # Get all aligned .fits files
+    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith('.fits')]
+    
+    if not aligned_files:
+        print("No aligned .fits files found in the AlignedImages folder.")
+        return
+    
+    # Load each aligned file, extract the centered region, and analyze/visualize
+    for file in aligned_files:
+        file_path = os.path.join(aligned_folder, file)
+        try:
+            # Load the aligned image
+            with fits.open(file_path) as hdul:
+                aligned_data = hdul[0].data
+            
+            # Extract the centered region
+            centered_region = extract_centered_region(aligned_data, output_size)
+            
+            # Perform analysis or visualization
+            print(f"Processing {file}:")
+            print(f"Centered region shape: {centered_region.shape}")
+            
+            # Flatten the centered region and get pixel intensities
+            flat_intensities = centered_region.flatten()
+            
+            # Sort the intensities in ascending order
+            sorted_indices = np.argsort(flat_intensities)
+            sorted_intensities = flat_intensities[sorted_indices]
+            
+            # Calculate the range for the median 10%
+            total_pixels = len(sorted_intensities)
+            median_10_start = int(total_pixels * 0.45)  # Start of median 10%
+            median_10_end = int(total_pixels * 0.55)    # End of median 10%
+            
+            # Get the median 10% intensities
+            median_10_intensities = sorted_intensities[median_10_start:median_10_end]
+            
+            # Get the coordinates of the median 10% pixels
+            median_10_indices = sorted_indices[median_10_start:median_10_end]
+            median_10_coords = np.unravel_index(median_10_indices, centered_region.shape)
+            
+            # Visualize the centered region with median 10% pixels highlighted
+            plt.figure(figsize=(6, 6))
+            plt.imshow(centered_region, cmap='gray')
+            
+            # Overlay the median 10% pixels
+            plt.scatter(median_10_coords[1], median_10_coords[0], c='red', s=10, label='Median 10%')
+            plt.title(f"Centered Region: {file}")
+            plt.legend()
+            plt.axis('off')
+            plt.show()
+            
+        except Exception as e:
+            print(f"Error processing {file}: {str(e)}")
 
+### Test Usage
 if __name__ == "__main__":
     folder_path = 'TestImages'
     shifts_file_name = 'shifts.csv'
     shifts_file = os.path.join(folder_path, shifts_file_name)
     
     try:
- 
+        # Perform spatial calibration and save aligned images
         aligned_images = spatial_calibration(folder_path, 40, shifts_file, 0, 800, 1000)
         
         if not aligned_images:
             print("No images processed successfully")
         else:
-            # Handle single image case
-            if len(aligned_images) == 1:
-                fig, ax = plt.subplots(figsize=(6, 6))  # Single subplot
-                file, aligned_image = aligned_images[0]
-                ax.imshow(aligned_image, cmap='gray')
-                ax.set_title(file)
-                ax.axis('off')
-            else:
-                # Multiple subplots for multiple images
-                fig, axes = plt.subplots(1, len(aligned_images), figsize=(15, 6))
-                for ax, (file, aligned_image) in zip(axes, aligned_images):
-                    ax.imshow(aligned_image, cmap='gray')
-                    ax.set_title(file)
-                    ax.axis('off')
-            plt.show()
-            
+            # Analyze the aligned images
+            analyze_aligned_images(folder_path, output_size=(100, 100))
     
-
     except Exception as e:
         print(f"Critical error: {str(e)}")
 
-    central_pixels = extract_centered_region()
 
 
