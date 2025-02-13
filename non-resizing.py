@@ -36,7 +36,6 @@ def load_shifts(file_path: str) -> dict:
         print(f"Warning: Error loading shifts - {str(e)}")
     return shifts
 
-
 def load_2D_array(filename: str, wavelength: int) -> np.ndarray:
     """
     Loads a single wavelength of the specified .fits file to an array.
@@ -269,6 +268,7 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
 
     return aligned_images
 
+
 def save_aligned_fits(original_path: str, new_path: str, aligned_data, shift_x: float, shift_y: float):
     """
     Save the aligned data as a new FITS file with updated header information.
@@ -293,46 +293,34 @@ def save_aligned_fits(original_path: str, new_path: str, aligned_data, shift_x: 
         hdul.writeto(new_path, overwrite=True)
 
     
-
 def extract_centered_region(input_array: np.ndarray, output_size: tuple = (100, 100)) -> np.ndarray:
-    """
-    Extracts a centered region of the specified size from the input array.
-
-    Args:
-        input_array (np.ndarray): The input array (2D or higher).
-        output_size (tuple): The desired size of the output region (height, width). Default is (100, 100).
-
-    Returns:
-        np.ndarray: A new array of the specified size, centered at the middle of the input array.
-
-    Raises:
-        ValueError: If the input array is not 2D or if the output size is larger than the input array.
-    """
-    # Ensure the input array is 2D
+    
+    
+    # Check to make sure the array is 2D (a flat image)
     if input_array.ndim != 2:
         raise ValueError("Input array must be 2D.")
     
     # Get the dimensions of the input array
     input_height, input_width = input_array.shape
-    
+     
     # Get the desired output dimensions
     output_height, output_width = output_size
     
     # Check if the output size is larger than the input array
     if output_height > input_height or output_width > input_width:
         raise ValueError("Output size cannot be larger than the input array dimensions.")
-    
+
     # Calculate the center of the input array
     center_y = input_height // 2
     center_x = input_width // 2
-    
+
     # Calculate the starting and ending indices for the centered region
     start_y = center_y - output_height // 2
     end_y = start_y + output_height
     start_x = center_x - output_width // 2
     end_x = start_x + output_width
-    
-    # Handle edge cases where the region goes out of bounds
+
+    # What happens if the region is outside the boundary
     if start_y < 0:
         start_y = 0
         end_y = output_height
@@ -345,13 +333,28 @@ def extract_centered_region(input_array: np.ndarray, output_size: tuple = (100, 
     if end_x > input_width:
         start_x = input_width - output_width
         end_x = input_width
-    
-    # Extract the centered region
+
+    # Extract the square from the middle of the array
     centered_region = input_array[start_y:end_y, start_x:end_x]
     
-    return centered_region
+    # Flatten the pixels into a 1D array, and then sort by intensity
+    flat_intensities = centered_region.flatten()
+    sorted_indices = np.argsort(flat_intensities)
+    sorted_intensities = flat_intensities[sorted_indices]
 
-def analyze_aligned_images(folder_path: str, output_size: tuple = (100, 100)):
+    # Calculate the range for the median 10%
+    num_of_pixels = len(sorted_intensities)
+    med_start = int(num_of_pixels * 0.45)  # Start of median 10%
+    med_end = int(num_of_pixels * 0.55)    # End of median 10%
+
+    # Select the median 10% of pixels, then get the coordinates
+    median_10 = sorted_indices[med_start:med_end]
+    median_10_coords = np.unravel_index(median_10, centered_region.shape)
+    
+    return centered_region, median_10_coords[1], median_10_coords[0]
+
+
+def wavelength_calibration(folder_path: str, output_size: tuple = (100, 100)):
     """
     Loads the aligned .fits files from the AlignedImages subfolder, extracts the centered region,
     orders the pixels by intensity, and retrieves the coordinates of the median 10%.
@@ -360,10 +363,10 @@ def analyze_aligned_images(folder_path: str, output_size: tuple = (100, 100)):
         folder_path (str): The path to the folder containing the original and aligned images.
         output_size (tuple): The size of the centered region to extract. Default is (100, 100).
     """
-    # Path to the AlignedImages subfolder
-    aligned_folder = os.path.join(folder_path, "AlignedImages")
-    
+
     # Check if the AlignedImages folder exists
+    aligned_folder = os.path.join(folder_path, "AlignedImages")
+
     if not os.path.isdir(aligned_folder):
         raise ValueError(f"AlignedImages folder not found in {folder_path}")
     
@@ -379,46 +382,13 @@ def analyze_aligned_images(folder_path: str, output_size: tuple = (100, 100)):
         file_path = os.path.join(aligned_folder, file)
         try:
             # Load the aligned image
-            with fits.open(file_path) as hdul:
-                aligned_data = hdul[0].data
             
-            # Extract the centered region
-            centered_region = extract_centered_region(aligned_data, output_size)
+            aligned_data = load_2D_array(file_path, 1)
             
-            # Perform analysis or visualization
-            print(f"Processing {file}:")
-            print(f"Centered region shape: {centered_region.shape}")
+            # Extract the centered region and get the median 10% coordinates
+            centered_region, median_10_x, median_10_y = extract_centered_region(aligned_data, output_size)
             
-            # Flatten the centered region and get pixel intensities
-            flat_intensities = centered_region.flatten()
-            
-            # Sort the intensities in ascending order
-            sorted_indices = np.argsort(flat_intensities)
-            sorted_intensities = flat_intensities[sorted_indices]
-            
-            # Calculate the range for the median 10%
-            total_pixels = len(sorted_intensities)
-            median_10_start = int(total_pixels * 0.45)  # Start of median 10%
-            median_10_end = int(total_pixels * 0.55)    # End of median 10%
-            
-            # Get the median 10% intensities
-            median_10_intensities = sorted_intensities[median_10_start:median_10_end]
-            
-            # Get the coordinates of the median 10% pixels
-            median_10_indices = sorted_indices[median_10_start:median_10_end]
-            median_10_coords = np.unravel_index(median_10_indices, centered_region.shape)
-            
-            # Visualize the centered region with median 10% pixels highlighted
-            plt.figure(figsize=(6, 6))
-            plt.imshow(centered_region, cmap='gray')
-            
-            # Overlay the median 10% pixels
-            plt.scatter(median_10_coords[1], median_10_coords[0], c='red', s=10, label='Median 10%')
-            plt.title(f"Centered Region: {file}")
-            plt.legend()
-            plt.axis('off')
-            plt.show()
-            
+
         except Exception as e:
             print(f"Error processing {file}: {str(e)}")
 
