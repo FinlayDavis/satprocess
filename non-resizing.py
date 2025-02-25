@@ -5,12 +5,12 @@ import scipy.ndimage as sp
 from skimage.transform import hough_circle, hough_circle_peaks
 from skimage.feature import canny
 from skimage.filters import threshold_otsu
-import tkinter as tk 
 from tkinter import *
-from PIL import Image 
-from PIL import ImageTk 
 import os
 import csv
+import cProfile
+import pstats
+
 
 def load_shifts(file_path: str) -> dict:
     """
@@ -25,10 +25,10 @@ def load_shifts(file_path: str) -> dict:
     shifts = {}
     try:
         if os.path.exists(file_path):
-            with open(file_path, mode='r') as file:
+            with open(file_path, mode="r") as file:
                 reader = csv.reader(file)
                 next(reader)  # Skip header
-                for row in reader: 
+                for row in reader:
                     if len(row) >= 3:
                         filename, shift_y, shift_x = row[0], float(row[1]), float(row[2])
                         shifts[filename] = (shift_y, shift_x)
@@ -36,52 +36,64 @@ def load_shifts(file_path: str) -> dict:
         print(f"Warning: Error loading shifts - {str(e)}")
     return shifts
 
-def load_2D_array(filename: str, wavelength: int) -> np.ndarray:
+
+def load_array(
+    filename: str,
+    mode: str = "full",
+    wavelength: int = None,
+    x_coord: int = None,
+    y_coord: int = None,
+) -> np.ndarray:
     """
-    Loads a single wavelength of the specified .fits file to an array.
+    Loads data from the specified .fits file based on the mode.
 
     Args:
         filename (str): The name of the .fits file to be loaded.
-        wavelength (int): The index of the wavelength to extract.
+        mode (str): The mode of loading. Options: "full", "slice", "spectrum".
+        wavelength (int): The index of the wavelength to extract (required for "slice" mode).
+        x_coord (int): The x-coordinate of the pixel (required for "spectrum" mode).
+        y_coord (int): The y-coordinate of the pixel (required for "spectrum" mode).
 
     Returns:
-        np.ndarray: A 2D array of the solar image at the specified wavelength.
+        np.ndarray: The loaded data.
 
     Raises:
-        FileNotFoundError: If the specified file does not exist.
-        ValueError: If the specified wavelength is out of bounds.
-        IndexError: If the .fits file does not have the expected 3D structure.
+        ValueError: If the mode or parameters are invalid.
     """
-    # Check if the file exists
     if not os.path.isfile(filename):
         raise FileNotFoundError(f"The file {filename} does not exist.")
-    
-    try:
-        with fits.open(filename) as hdul:
-            # Ensure the file has the expected structure
-            if len(hdul) < 2:
-                raise IndexError("The .fits file does not contain the expected data extension.")
-            
-            data = hdul[1].data
-            
-            # Check if the data is 3D
-            if data.ndim != 3:
-                raise IndexError("The .fits file data is not 3D (expected [wavelength, x, y]).")
-            
-            # Check if the wavelength index is valid
+
+    with fits.open(filename) as hdul:
+        if len(hdul) < 2:
+            raise IndexError("The .fits file does not contain the expected data extension.")
+
+        data = hdul[1].data
+
+        if data.ndim != 3:
+            raise IndexError("The .fits file data is not 3D (expected [wavelength, x, y]).")
+
+        if mode == "full":
+            return data
+        elif mode == "slice":
+            if wavelength is None:
+                raise ValueError("Wavelength must be specified for 'slice' mode.")
             if wavelength < 0 or wavelength >= data.shape[0]:
                 raise ValueError(
                     f"Wavelength index {wavelength} is out of bounds. "
                     f"Valid range is 0 to {data.shape[0] - 1}."
                 )
-            
-            # Extract the specified wavelength
-            array = data[wavelength, :, :]
-            return array
-    
-    except Exception as e:
-        # Catch any unexpected errors and re-raise with context
-        raise RuntimeError(f"An error occurred while processing {filename}: {str(e)}")
+            return data[wavelength, :, :]
+        elif mode == "spectrum":
+            if x_coord is None or y_coord is None:
+                raise ValueError("x_coord and y_coord must be specified for 'spectrum' mode.")
+            if x_coord < 0 or x_coord >= data.shape[1] or y_coord < 0 or y_coord >= data.shape[2]:
+                raise ValueError(
+                    f"Coordinates ({x_coord}, {y_coord}) are out of bounds. "
+                    f"Valid ranges are x: 0 to {data.shape[1] - 1}, y: 0 to {data.shape[2] - 1}."
+                )
+            return data[:, x_coord, y_coord]
+        else:
+            raise ValueError(f"Invalid mode: {mode}. Options are 'full', 'slice', 'spectrum'.")
 
 
 def save_shifts(file_path: str, shifts: csv):
@@ -96,16 +108,16 @@ def save_shifts(file_path: str, shifts: csv):
     if directory:  # Only create if path contains directories
         os.makedirs(directory, exist_ok=True)
     try:
-        with open(file_path, mode='w', newline='') as file:
+        with open(file_path, mode="w", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow(['filename', 'shift_y', 'shift_x'])
+            writer.writerow(["filename", "shift_y", "shift_x"])
             for filename, (shift_y, shift_x) in shifts.items():
                 writer.writerow([filename, shift_y, shift_x])
     except IOError as e:
         print(f"Error saving shifts: {str(e)}")
 
 
-def preprocess(image_array: np.ndarray)-> np.ndarray:
+def preprocess(image_array: np.ndarray) -> np.ndarray:
     """
     Preprocessing a 2D image array so it is easier for the Hough transform to identify features.
 
@@ -115,11 +127,11 @@ def preprocess(image_array: np.ndarray)-> np.ndarray:
     Returns:
         np.ndarray: The processed image.
     """
-    # Apply Gaussian blur 
-    blurred = sp.gaussian_filter(image_array, sigma=2) 
+    # Apply Gaussian blur
+    blurred = sp.gaussian_filter(image_array, sigma=2)
 
-    # Apply thresholding 
-    thresh = threshold_otsu(blurred) 
+    # Apply thresholding
+    thresh = threshold_otsu(blurred)
     binary = blurred > thresh
 
     # Compute edge map using Canny for better performance
@@ -127,7 +139,7 @@ def preprocess(image_array: np.ndarray)-> np.ndarray:
     return edges
 
 
-def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000)-> np.ndarray:
+def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) -> np.ndarray:
     """
     Performs the circular hough transform on the inputted 2D array, looking for circles in the specified size range.
 
@@ -140,7 +152,9 @@ def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000)-> 
         np.ndarray: An array containing all the found circles (hopefully just the one)
     """
     # Perform Circular Hough Transform for large circles
-    hough_radii = np.arange(minrad, maxrad, 1)  # Look for circle radii in the range 800-1000 (in the array, the radius of the sun is 925 for this file), with a step size of 3
+    hough_radii = np.arange(
+        minrad, maxrad, 1
+    )  # Look for circle radii in the range 800-1000 (in the array, the radius of the sun is 925 for this file), with a step size of 3
     hough_res = hough_circle(edges, hough_radii)
 
     # Identify circles
@@ -150,7 +164,7 @@ def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000)-> 
     return identifiedCircles
 
 
-def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int)-> np.ndarray:
+def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int) -> np.ndarray:
     """
     Transforms the inputted array by an x and y value.
 
@@ -167,7 +181,14 @@ def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int)-> np.ndarr
     return alignedArray
 
 
-def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str = 'shifts.csv', default_file: int = 0, minrad: int = 800, maxrad: int = 1000):
+def spatial_calibration(
+    folder_path: str,
+    wavelength: int = 1,
+    shifts_file: str = "shifts.csv",
+    default_file: int = 0,
+    minrad: int = 800,
+    maxrad: int = 1000,
+):
     """
     Main processing pipeline with validation
 
@@ -193,18 +214,17 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
     # Validate input directory
     if not os.path.isdir(folder_path):
         raise ValueError(f"Directory {folder_path} not found")
-    
+
     # Create the AlignedImages subfolder if it doesn't exist
     aligned_folder = os.path.join(folder_path, "AlignedImages")
     os.makedirs(aligned_folder, exist_ok=True)
-    
+
     # Get files with multiple validation checks
     try:
-        files = [f for f in os.listdir(folder_path) 
-                if f.lower().endswith(('.fits', '.jpg'))]
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith((".fits", ".jpg"))]
     except Exception as e:
-        raise RuntimeError(f"Error accessing directory: {str(e)}")  
-    
+        raise RuntimeError(f"Error accessing directory: {str(e)}")
+
     if not files:
         raise ValueError("No valid image files found")
     if default_file >= len(files):
@@ -217,7 +237,7 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
     try:
         ref_file = files[default_file]
         ref_path = os.path.join(folder_path, ref_file)
-        ref_array = load_2D_array(ref_path, wavelength)
+        ref_array = load_array(ref_path, "slice", wavelength)
         ref_edges = preprocess(ref_array)
         ref_circles = hough_transform(ref_edges, minrad, maxrad)
         ref_centroid = ref_circles[0][:2]
@@ -233,7 +253,7 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
                 print(f"Skipping missing file: {file}")
                 continue
 
-            file_array = load_2D_array(file_path, wavelength)
+            file_array = load_array(file_path, "slice", wavelength)
             file_edges = preprocess(file_array)
 
             # Calculate or load shifts
@@ -241,7 +261,7 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
                 shift_y, shift_x = shifts[file]
             else:
                 file_circles = hough_transform(file_edges, minrad, maxrad)
-                file_centroid = file_circles[0][:2]   
+                file_centroid = file_circles[0][:2]
                 shift_x = ref_centroid[0] - file_centroid[0]
                 shift_y = ref_centroid[1] - file_centroid[1]
                 shifts[file] = (shift_y, shift_x)
@@ -251,11 +271,11 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
             aligned_images.append((file, aligned))
 
             # Save the aligned image as a new FITS file in the AlignedImages subfolder
-            if file.lower().endswith('.fits'):
+            if file.lower().endswith(".fits"):
                 new_file_name = f"{os.path.splitext(file)[0]}_aligned.fits"
                 new_file_path = os.path.join(aligned_folder, new_file_name)
                 save_aligned_fits(file_path, new_file_path, aligned, shift_x, shift_y)
-            
+
         except Exception as e:
             print(f"Skipping {file} due to error: {str(e)}")
             continue
@@ -269,7 +289,9 @@ def spatial_calibration(folder_path: str, wavelength: int = 1, shifts_file: str 
     return aligned_images
 
 
-def save_aligned_fits(original_path: str, new_path: str, aligned_data, shift_x: float, shift_y: float):
+def save_aligned_fits(
+    original_path: str, new_path: str, aligned_data, shift_x: float, shift_y: float
+):
     """
     Save the aligned data as a new FITS file with updated header information.
 
@@ -283,133 +305,200 @@ def save_aligned_fits(original_path: str, new_path: str, aligned_data, shift_x: 
     # Read the original FITS file
     with fits.open(original_path) as hdul:
         # Update the header with the shift information
-        hdul[0].header['SHIFT_X'] = (shift_x, 'X-axis shift applied during alignment')
-        hdul[0].header['SHIFT_Y'] = (shift_y, 'Y-axis shift applied during alignment')
-        
+        hdul[0].header["SHIFT_X"] = (shift_x, "X-axis shift applied during alignment")
+        hdul[0].header["SHIFT_Y"] = (shift_y, "Y-axis shift applied during alignment")
+
         # Replace the data with the aligned data
         hdul[0].data = aligned_data
-        
+
         # Save the new FITS file
         hdul.writeto(new_path, overwrite=True)
 
-    
-def extract_centered_region(input_array: np.ndarray, output_size: tuple = (100, 100)) -> np.ndarray:
-    
-    
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def median_pixels(
+    input_array: np.ndarray, center_x: int, center_y: int, square_size: int = 100, percentage: int = 10
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Extracts a square region from the input array and returns the coordinates of the median percentage of pixels
+    relative to the full image.
+
+    Args:
+        input_array (np.ndarray): The input 2D array.
+        center_x (int): The x-coordinate for the center of the square region.
+        center_y (int): The y-coordinate for the center of the square region.
+        square_size (int): The size of the square region to extract (default is 100x100 pixels).
+        percentage (int): The percentage of pixels to extract (e.g., 10 for median 10%).
+
+    Returns:
+        tuple: Arrays of x and y coordinates for the median percentage of pixels, relative to the full image.
+
+    Raises:
+        ValueError: If the input array is not 2D or if the square region is out of bounds.
+    """
     # Check to make sure the array is 2D (a flat image)
     if input_array.ndim != 2:
         raise ValueError("Input array must be 2D.")
-    
+
     # Get the dimensions of the input array
     input_height, input_width = input_array.shape
-     
-    # Get the desired output dimensions
-    output_height, output_width = output_size
-    
-    # Check if the output size is larger than the input array
-    if output_height > input_height or output_width > input_width:
-        raise ValueError("Output size cannot be larger than the input array dimensions.")
 
-    # Calculate the center of the input array
-    center_y = input_height // 2
-    center_x = input_width // 2
+    # Calculate the starting and ending indices for the square region
+    half_size = square_size // 2
+    start_y = center_y - half_size
+    end_y = center_y + half_size
+    start_x = center_x - half_size
+    end_x = center_x + half_size
 
-    # Calculate the starting and ending indices for the centered region
-    start_y = center_y - output_height // 2
-    end_y = start_y + output_height
-    start_x = center_x - output_width // 2
-    end_x = start_x + output_width
+    # Ensure the region is within bounds
+    start_y = max(0, start_y)
+    end_y = min(input_height, end_y)
+    start_x = max(0, start_x)
+    end_x = min(input_width, end_x)
 
-    # What happens if the region is outside the boundary
-    if start_y < 0:
-        start_y = 0
-        end_y = output_height
-    if start_x < 0:
-        start_x = 0
-        end_x = output_width
-    if end_y > input_height:
-        start_y = input_height - output_height
-        end_y = input_height
-    if end_x > input_width:
-        start_x = input_width - output_width
-        end_x = input_width
+    # Extract the square region
+    square_region = input_array[start_y:end_y, start_x:end_x]
 
-    # Extract the square from the middle of the array
-    centered_region = input_array[start_y:end_y, start_x:end_x]
-    
     # Flatten the pixels into a 1D array, and then sort by intensity
-    flat_intensities = centered_region.flatten()
+    flat_intensities = square_region.flatten()
     sorted_indices = np.argsort(flat_intensities)
     sorted_intensities = flat_intensities[sorted_indices]
 
-    # Calculate the range for the median 10%
+    # Calculate the range for the median percentage
     num_of_pixels = len(sorted_intensities)
-    med_start = int(num_of_pixels * 0.45)  # Start of median 10%
-    med_end = int(num_of_pixels * 0.55)    # End of median 10%
+    med_start = int(num_of_pixels * (50 - percentage / 2) / 100)  # Start of median percentage
+    med_end = int(num_of_pixels * (50 + percentage / 2) / 100)    # End of median percentage
 
-    # Select the median 10% of pixels, then get the coordinates
-    median_10 = sorted_indices[med_start:med_end]
-    median_10_coords = np.unravel_index(median_10, centered_region.shape)
-    
-    return centered_region, median_10_coords[1], median_10_coords[0]
+    # Select the median percentage of pixels
+    median_pixels_indices = sorted_indices[med_start:med_end]
 
+    # Get the coordinates of the median pixels relative to the full image
+    y_coords, x_coords = np.unravel_index(median_pixels_indices, square_region.shape)
+    median_y_full = y_coords + start_y
+    median_x_full = x_coords + start_x
 
-def wavelength_calibration(folder_path: str, output_size: tuple = (100, 100)):
-    """
-    Loads the aligned .fits files from the AlignedImages subfolder, extracts the centered region,
-    orders the pixels by intensity, and retrieves the coordinates of the median 10%.
+    # Debug: Plot the image with the square region and median pixels
+    plt.imshow(input_array, cmap='gray')
+    plt.scatter(median_x_full, median_y_full, c='red', s=10, label='Median Pixels')
+    plt.scatter(center_x, center_y, c='blue', s=50, marker='x', label='Center')
+    plt.title("Square Region with Median Pixels")
+    plt.legend()
+    plt.show()
 
-    Args:
-        folder_path (str): The path to the folder containing the original and aligned images.
-        output_size (tuple): The size of the centered region to extract. Default is (100, 100).
-    """
+    return median_x_full, median_y_full
 
+def wavelength_calibration(folder_path: str, percentage: int = 10):
     # Check if the AlignedImages folder exists
     aligned_folder = os.path.join(folder_path, "AlignedImages")
-
+    
     if not os.path.isdir(aligned_folder):
         raise ValueError(f"AlignedImages folder not found in {folder_path}")
-    
+
     # Get all aligned .fits files
-    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith('.fits')]
-    
+    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith(".fits")]
+
     if not aligned_files:
         print("No aligned .fits files found in the AlignedImages folder.")
         return
-    
-    # Load each aligned file, extract the centered region, and analyze/visualize
+
+    rolling_avg = None  # Stores the rolling average spectrum
+    num_pixels = 0      # Tracks the total number of pixels processed
+
+    # Cache decompressed data
+    decompressed_data_cache = {}
+
     for file in aligned_files:
         file_path = os.path.join(aligned_folder, file)
         try:
-            # Load the aligned image
+            # Decompress and cache the data
+            if file_path not in decompressed_data_cache:
+                aligned_data = load_array(file_path, "slice", 1)
+                decompressed_data_cache[file_path] = aligned_data
+            else:
+                aligned_data = decompressed_data_cache[file_path]
             
-            aligned_data = load_2D_array(file_path, 1)
-            
-            # Extract the centered region and get the median 10% coordinates
-            centered_region, median_10_x, median_10_y = extract_centered_region(aligned_data, output_size)
-            
+            edges = preprocess(aligned_data)
+            results = hough_transform(edges)
+
+            # Check if any circles were detected
+            if results.size == 0:
+                print(f"No circles detected in {file}. Skipping.")
+                continue
+
+            # Use the first detected circle
+            center_x, center_y, _ = results[0]
+
+            # Extract the centered region and get the median percentage coordinates
+            median_10_x, median_10_y = median_pixels(aligned_data, center_x, center_y, percentage=percentage)
+
+            # Process each median pixel
+            for i in range(len(median_10_x)):
+                # Load the 1D spectrum for the specified pixel
+                wavelength_data = load_array(file_path, mode="spectrum", x_coord=median_10_x[i], y_coord=median_10_y[i])
+
+                # Update the rolling average
+                if rolling_avg is None:
+                    rolling_avg = wavelength_data  # Initialize with the first spectrum
+                else:
+                    rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (num_pixels + 1)
+
+                # Increment the number of pixels processed
+                num_pixels += 1
+
+            # Print the final rolling average for the file
+            print(f"Final rolling average for {file_path}: {rolling_avg}")
 
         except Exception as e:
-            print(f"Error processing {file}: {str(e)}")
+            print(f"Error processing {file_path}: {str(e)}")
+
+    # Print the overall rolling average after processing all files
+    print(f"Overall rolling average after processing all files: {rolling_avg}")
+
+    # Plot the final rolling average as a wavelength graph
+    plt.figure(figsize=(10, 6))
+    plt.plot(rolling_avg, label='Rolling Average Spectrum')
+    plt.xlabel('Wavelength')
+    plt.ylabel('Intensity')
+    plt.title('Final Rolling Average Wavelength Graph')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+
+def wavelength_calibration_profiled():
+    wavelength_calibration("TestImages", 10)
+
 
 ### Test Usage
 if __name__ == "__main__":
-    folder_path = 'TestImages'
-    shifts_file_name = 'shifts.csv'
+    folder_path = "TestImages"
+    shifts_file_name = "shifts.csv"
     shifts_file = os.path.join(folder_path, shifts_file_name)
-    
+
     try:
         # Perform spatial calibration and save aligned images
         aligned_images = spatial_calibration(folder_path, 40, shifts_file, 0, 800, 1000)
-        
+
         if not aligned_images:
             print("No images processed successfully")
         else:
-            # Analyze the aligned images
-            analyze_aligned_images(folder_path, output_size=(100, 100))
-    
+
+            # Profile the function
+            profiler = cProfile.Profile()
+            profiler.enable()
+
+            wavelength_calibration_profiled()
+
+            profiler.disable()
+
+            # Write the profiling results to a file
+            with open("profile_stats.txt", "w") as f:
+                stats = pstats.Stats(profiler, stream=f)
+                stats.strip_dirs()
+                stats.sort_stats(pstats.SortKey.TIME)
+                stats.print_stats()
+
     except Exception as e:
         print(f"Critical error: {str(e)}")
-
-
-
