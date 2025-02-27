@@ -319,7 +319,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def median_pixels(
-    input_array: np.ndarray, center_x: int, center_y: int, square_size: int = 100, percentage: int = 10
+    input_array: np.ndarray, center_x: int, center_y: int, square_size: int = 100, percentage: int = 1
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Extracts a square region from the input array and returns the coordinates of the median percentage of pixels
@@ -330,7 +330,7 @@ def median_pixels(
         center_x (int): The x-coordinate for the center of the square region.
         center_y (int): The y-coordinate for the center of the square region.
         square_size (int): The size of the square region to extract (default is 100x100 pixels).
-        percentage (int): The percentage of pixels to extract (e.g., 10 for median 10%).
+        percentage (int): The percentage of pixels to extract (e.g., 1 for median 1%).
 
     Returns:
         tuple: Arrays of x and y coordinates for the median percentage of pixels, relative to the full image.
@@ -371,6 +371,10 @@ def median_pixels(
     med_start = int(num_of_pixels * (50 - percentage / 2) / 100)  # Start of median percentage
     med_end = int(num_of_pixels * (50 + percentage / 2) / 100)    # End of median percentage
 
+    print(num_of_pixels)
+    print(med_start)
+    print(med_end)
+
     # Select the median percentage of pixels
     median_pixels_indices = sorted_indices[med_start:med_end]
 
@@ -389,7 +393,7 @@ def median_pixels(
 
     return median_x_full, median_y_full
 
-def wavelength_calibration(folder_path: str, percentage: int = 10):
+def wavelength_calibration(folder_path: str, square_size: int = 100, percentage: int = 1):
     # Check if the AlignedImages folder exists
     aligned_folder = os.path.join(folder_path, "AlignedImages")
     
@@ -403,11 +407,8 @@ def wavelength_calibration(folder_path: str, percentage: int = 10):
         print("No aligned .fits files found in the AlignedImages folder.")
         return
 
-    rolling_avg = None  # Stores the rolling average spectrum
-    num_pixels = 0      # Tracks the total number of pixels processed
-
-    # Cache decompressed data
-    decompressed_data_cache = {}
+    rolling_averages = []  # List to store rolling averages for each file
+    decompressed_data_cache = {}  # Cache decompressed data
 
     for file in aligned_files:
         file_path = os.path.join(aligned_folder, file)
@@ -431,13 +432,17 @@ def wavelength_calibration(folder_path: str, percentage: int = 10):
             center_x, center_y, _ = results[0]
 
             # Extract the centered region and get the median percentage coordinates
-            median_10_x, median_10_y = median_pixels(aligned_data, center_x, center_y, percentage=percentage)
+            median_10_x, median_10_y = median_pixels(aligned_data, center_x, center_y, square_size=square_size, percentage=percentage)
+
+            # Initialize rolling average for this file
+            rolling_avg = None
+            num_pixels = 0
 
             # Process each median pixel
             for i in range(len(median_10_x)):
                 # Load the 1D spectrum for the specified pixel
                 wavelength_data = load_array(file_path, mode="spectrum", x_coord=median_10_x[i], y_coord=median_10_y[i])
-
+                
                 # Update the rolling average
                 if rolling_avg is None:
                     rolling_avg = wavelength_data  # Initialize with the first spectrum
@@ -450,25 +455,28 @@ def wavelength_calibration(folder_path: str, percentage: int = 10):
             # Print the final rolling average for the file
             print(f"Final rolling average for {file_path}: {rolling_avg}")
 
+            # Add this rolling average to the list
+            rolling_averages.append((file, rolling_avg))
+
         except Exception as e:
             print(f"Error processing {file_path}: {str(e)}")
 
-    # Print the overall rolling average after processing all files
-    print(f"Overall rolling average after processing all files: {rolling_avg}")
-
-    # Plot the final rolling average as a wavelength graph
+    # Plot the rolling averages for all files
     plt.figure(figsize=(10, 6))
-    plt.plot(rolling_avg, label='Rolling Average Spectrum')
+    for file, spectrum in rolling_averages:
+        plt.plot(spectrum, label=file)  # Plot each spectrum with a label
+
     plt.xlabel('Wavelength')
     plt.ylabel('Intensity')
-    plt.title('Final Rolling Average Wavelength Graph')
+    plt.title('Rolling Average Spectra for All Files')
     plt.legend()
     plt.grid(True)
     plt.show()
-    
 
+     
 def wavelength_calibration_profiled():
-    wavelength_calibration("TestImages", 10)
+    # The folder, and how wide the range of median pixels is (1% is 100 pixels)
+    wavelength_calibration("TestImages", 100, 1)
 
 
 ### Test Usage
@@ -479,18 +487,19 @@ if __name__ == "__main__":
 
     try:
         # Perform spatial calibration and save aligned images
+        # Directs to the folder path listed above, using a middle wavelength (40), starting at the first file and with a radius range of 200
         aligned_images = spatial_calibration(folder_path, 40, shifts_file, 0, 800, 1000)
 
         if not aligned_images:
             print("No images processed successfully")
         else:
 
-            # Profile the function
+            # Profile the function (Testing the timings on which process is slowest)
             profiler = cProfile.Profile()
             profiler.enable()
 
+            # This actually runs the wavelength calibration
             wavelength_calibration_profiled()
-
             profiler.disable()
 
             # Write the profiling results to a file
