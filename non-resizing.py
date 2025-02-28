@@ -10,7 +10,8 @@ import os
 import csv
 import cProfile
 import pstats
-
+import concurrent.futures
+import psutil  # For CPU core count
 
 def load_shifts(file_path: str) -> dict:
     """
@@ -163,6 +164,50 @@ def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) ->
     identifiedCircles = np.array(list(zip(cx, cy, radii)))
     return identifiedCircles
 
+# Somewhere in the code below is a memory leak? Or some sort of overload causing the following error:
+# Critical error: Reference processing failed: [WinError 1450] Insufficient system resources exist to complete the requested service
+
+"""
+def process_radius_chunk(edges, radii):
+    ""Process a chunk of radii using the Hough transform.""
+    return hough_circle(edges, radii)
+
+def hough_transform_parallel(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000, num_workers: int = 4) -> np.ndarray:
+    ""
+    Performs the circular Hough transform on the inputted 2D array in parallel.
+
+    Args:
+        edges (np.ndarray): The 2D array containing the image data.
+        minrad (int): Minimum radius of identified circles.
+        maxrad (int): Maximum radius of identified circles.
+        num_workers (int): Number of parallel workers.
+
+    Returns:
+        np.ndarray: An array containing all the found circles.
+    ""
+    # Divide the radius range into chunks for parallel processing
+    radius_chunks = np.array_split(np.arange(minrad, maxrad), num_workers)
+    
+    # Use ProcessPoolExecutor to parallelize the Hough transform
+    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit tasks for each radius chunk
+        futures = [executor.submit(process_radius_chunk, edges, chunk) for chunk in radius_chunks]
+
+        # Collect results as they complete
+        hough_res_chunks = []
+        for future in concurrent.futures.as_completed(futures):
+            hough_res_chunks.append(future.result())
+
+    # Combine the results from all chunks
+    hough_res = np.concatenate(hough_res_chunks, axis=0)
+
+    # Identify circles
+    accums, cx, cy, radii = hough_circle_peaks(hough_res, np.arange(minrad, maxrad), total_num_peaks=1)
+
+    identified_circles = np.array(list(zip(cx, cy, radii)))
+    return identified_circles
+
+"""
 
 def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int) -> np.ndarray:
     """
@@ -314,10 +359,6 @@ def save_aligned_fits(
         # Save the new FITS file
         hdul.writeto(new_path, overwrite=True)
 
-
-import numpy as np
-import matplotlib.pyplot as plt
-
 def median_pixels(
     input_array: np.ndarray, center_x: int, center_y: int, square_size: int = 100, percentage: int = 1
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -393,6 +434,87 @@ def median_pixels(
 
     return median_x_full, median_y_full
 
+
+def process_pixel(file_path, x, y):
+    """
+    Process a single pixel and return its spectrum.
+    """
+    try:
+        # Load only the spectrum for the specified pixel (avoid loading the entire 3D array)
+        with fits.open(file_path, memmap=True) as hdul:  # Use memory-mapped files
+            data = hdul[1].data
+            wavelength_data = data[:, x, y]  # Extract the spectrum for the pixel
+        return wavelength_data
+    except Exception as e:
+        print(f"Error processing pixel ({x}, {y}) in {file_path}: {str(e)}")
+        return None
+
+def process_file(file_path, square_size, percentage, max_workers):
+    """
+    Process a single file and return its rolling average spectrum.
+    """
+    try:
+        # Decompress and cache the data
+        aligned_data = load_array(file_path, "slice", 1)
+        edges = preprocess(aligned_data)
+
+        # Perform parallel Hough transform
+        results = hough_transform(edges, minrad=800, maxrad=1000)
+
+        # Check if any circles were detected
+        if results.size == 0:
+            print(f"No circles detected in {file_path}. Skipping.")
+            return None
+
+        # Use the first detected circle
+        center_x, center_y, _ = results[0]
+
+        # Extract the centered region and get the median percentage coordinates
+        median_10_x, median_10_y = median_pixels(aligned_data, center_x, center_y, square_size=square_size, percentage=percentage)
+
+        # Initialize rolling average for this file
+        rolling_avg = None
+        num_pixels = 0
+
+        # Use ProcessPoolExecutor with limited workers to reduce CPU usage
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit tasks for each pixel
+            futures = [executor.submit(process_pixel, file_path, median_10_x[i], median_10_y[i]) for i in range(len(median_10_x))]
+
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                wavelength_data = future.result()
+                if wavelength_data is not None:
+                    # Update the rolling average
+                    if rolling_avg is None:
+                        rolling_avg = wavelength_data  # Initialize with the first spectrum
+                    else:
+                        rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (num_pixels + 1)
+
+                    # Increment the number of pixels processed
+                    num_pixels += 1
+
+        print(f"Final rolling average for {file_path}: {rolling_avg}")
+        return file_path, rolling_avg
+
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+        return None
+
+
+def is_memory_available(threshold: float = 0.8) -> bool:
+    """
+    Check if the available memory is above a threshold.
+
+    Args:
+        threshold (float): Memory usage threshold (0.8 = 80%).
+
+    Returns:
+        bool: True if memory is available, False otherwise.
+    """
+    mem = psutil.virtual_memory()
+    return mem.available / mem.total > threshold
+
 def wavelength_calibration(folder_path: str, square_size: int = 100, percentage: int = 1):
     # Check if the AlignedImages folder exists
     aligned_folder = os.path.join(folder_path, "AlignedImages")
@@ -408,58 +530,20 @@ def wavelength_calibration(folder_path: str, square_size: int = 100, percentage:
         return
 
     rolling_averages = []  # List to store rolling averages for each file
-    decompressed_data_cache = {}  # Cache decompressed data
 
+    # Process each file sequentially or in parallel based on memory availability
     for file in aligned_files:
         file_path = os.path.join(aligned_folder, file)
-        try:
-            # Decompress and cache the data
-            if file_path not in decompressed_data_cache:
-                aligned_data = load_array(file_path, "slice", 1)
-                decompressed_data_cache[file_path] = aligned_data
-            else:
-                aligned_data = decompressed_data_cache[file_path]
-            
-            edges = preprocess(aligned_data)
-            results = hough_transform(edges)
 
-            # Check if any circles were detected
-            if results.size == 0:
-                print(f"No circles detected in {file}. Skipping.")
-                continue
+        # Adjust the number of workers based on available memory
+        if is_memory_available():
+            max_workers = 4  # Use more workers if memory is available
+        else:
+            max_workers = 1  # Use fewer workers if memory is low
 
-            # Use the first detected circle
-            center_x, center_y, _ = results[0]
-
-            # Extract the centered region and get the median percentage coordinates
-            median_10_x, median_10_y = median_pixels(aligned_data, center_x, center_y, square_size=square_size, percentage=percentage)
-
-            # Initialize rolling average for this file
-            rolling_avg = None
-            num_pixels = 0
-
-            # Process each median pixel
-            for i in range(len(median_10_x)):
-                # Load the 1D spectrum for the specified pixel
-                wavelength_data = load_array(file_path, mode="spectrum", x_coord=median_10_x[i], y_coord=median_10_y[i])
-                
-                # Update the rolling average
-                if rolling_avg is None:
-                    rolling_avg = wavelength_data  # Initialize with the first spectrum
-                else:
-                    rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (num_pixels + 1)
-
-                # Increment the number of pixels processed
-                num_pixels += 1
-
-            # Print the final rolling average for the file
-            print(f"Final rolling average for {file_path}: {rolling_avg}")
-
-            # Add this rolling average to the list
-            rolling_averages.append((file, rolling_avg))
-
-        except Exception as e:
-            print(f"Error processing {file_path}: {str(e)}")
+        result = process_file(file_path, square_size, percentage, max_workers)
+        if result is not None:
+            rolling_averages.append(result)
 
     # Plot the rolling averages for all files
     plt.figure(figsize=(10, 6))
@@ -473,7 +557,7 @@ def wavelength_calibration(folder_path: str, square_size: int = 100, percentage:
     plt.grid(True)
     plt.show()
 
-     
+
 def wavelength_calibration_profiled():
     # The folder, and how wide the range of median pixels is (1% is 100 pixels)
     wavelength_calibration("TestImages", 100, 1)
