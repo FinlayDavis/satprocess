@@ -11,9 +11,10 @@ import scipy.ndimage as sp
 from skimage.transform import hough_circle, hough_circle_peaks
 from skimage.feature import canny
 from skimage.filters import threshold_otsu
+from scipy.interpolate import interp1d
 from tkinter import *
 
-
+# 0.024 A for pixel spectral resolution
 
 def load_shifts(file_path: str) -> dict:
     """
@@ -260,7 +261,7 @@ def spatial_calibration(
     maxrad: int = 1000,
 ):
     """
-    Main processing pipeline with validation
+    Spatially calibrates all the .fits files in the input folder, referenced to the default file.
 
     Args:
         folder_path (str): The name of the folder which holds the .fits files.
@@ -393,7 +394,7 @@ def median_pixels(
     center_y: int,
     square_size: int = 100,
     percentage: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     """
     Extracts a square region from the input array and returns the coordinates of the median percentage of pixels
     relative to the full image.
@@ -406,10 +407,8 @@ def median_pixels(
         percentage (int): The percentage of pixels to extract (e.g., 1 for median 1%).
 
     Returns:
-        tuple: Arrays of x and y coordinates for the median percentage of pixels, relative to the full image.
-
-    Raises:
-        ValueError: If the input array is not 2D or if the square region is out of bounds.
+        tuple: Arrays of x and y coordinates for the median percentage of pixels, relative to the full image,
+               and the starting indices (start_x, start_y) of the square region.
     """
     # Check to make sure the array is 2D (a flat image)
     if input_array.ndim != 2:
@@ -420,16 +419,10 @@ def median_pixels(
 
     # Calculate the starting and ending indices for the square region
     half_size = square_size // 2
-    start_y = center_y - half_size
-    end_y = center_y + half_size
-    start_x = center_x - half_size
-    end_x = center_x + half_size
-
-    # Ensure the region is within bounds
-    start_y = max(0, start_y)
-    end_y = min(input_height, end_y)
-    start_x = max(0, start_x)
-    end_x = min(input_width, end_x)
+    start_y = max(0, center_y - half_size)
+    end_y = min(input_height, center_y + half_size)
+    start_x = max(0, center_x - half_size)
+    end_x = min(input_width, center_x + half_size)
 
     # Extract the square region
     square_region = input_array[start_y:end_y, start_x:end_x]
@@ -441,12 +434,8 @@ def median_pixels(
 
     # Calculate the range for the median percentage
     num_of_pixels = len(sorted_intensities)
-    med_start = int(
-        num_of_pixels * (50 - percentage / 2) / 100
-    )  # Start of median percentage
-    med_end = int(
-        num_of_pixels * (50 + percentage / 2) / 100
-    )  # End of median percentage
+    med_start = int(num_of_pixels * (50 - percentage / 2) / 100)  # Start of median percentage
+    med_end = int(num_of_pixels * (50 + percentage / 2) / 100)    # End of median percentage
 
     # Select the median percentage of pixels
     median_pixels_indices = sorted_indices[med_start:med_end]
@@ -463,30 +452,45 @@ def median_pixels(
     plt.legend()
     plt.show()
 
-    return median_x_full, median_y_full
+    return median_x_full, median_y_full, start_x, start_y
 
 
-def process_pixel(file_path, x, y):
+def process_pixel(data_3d: np.ndarray, x: int, y: int):
     """
-    Process a single pixel and return its spectrum.
+    Extracts the spectrum for a single pixel from a preloaded 3D array.
+
+    Args:
+        data_3d (np.ndarray): The 3D array containing the wavelength data (shape: [wavelength, x, y]).
+        x (int): x-coordinate of the pixel.
+        y (int): y-coordinate of the pixel.
+
+    Returns:
+        np.ndarray: 1D array of the wavelength for that pixel.
     """
     try:
-        # Load only the spectrum for the specified pixel (avoid loading the entire 3D array)
-        with fits.open(file_path, memmap=True) as hdul:  # Use memory-mapped files
-            data = hdul[1].data
-            wavelength_data = data[:, x, y]  # Extract the spectrum for the pixel
+        # Extract the spectrum for the specified pixel
+        wavelength_data = data_3d[:, x, y]
         return wavelength_data
     except Exception as e:
-        print(f"Error processing pixel ({x}, {y}) in {file_path}: {str(e)}")
+        print(f"Error processing pixel ({x}, {y}): {str(e)}")
         return None
-
+    
 
 def process_file(file_path, square_size, percentage, max_workers):
     """
-    Process a single file and return its rolling average spectrum.
+    Processes a single file and calculates the rolling average spectrum for the median pixels.
+
+    Args:
+        file_path (str): Path to the .fits file.
+        square_size (int): Size of the square region to extract.
+        percentage (int): Percentage of median pixels to use.
+        max_workers (int): Maximum number of parallel workers.
+
+    Returns:
+        tuple: (file_path, rolling_average_spectrum)
     """
     try:
-        # Decompress and cache the data
+        # Load the aligned data and preprocess it
         aligned_data = load_array(file_path, "slice", 1)
         edges = preprocess(aligned_data)
         results = hough_transform(edges)
@@ -499,29 +503,28 @@ def process_file(file_path, square_size, percentage, max_workers):
         # Use the first detected circle
         center_x, center_y, _ = results[0]
 
-        # Extract the centered region and get the median percentage coordinates
-        median_10_x, median_10_y = median_pixels(
-            aligned_data,
-            center_x,
-            center_y,
-            square_size=square_size,
-            percentage=percentage,
-        )
+        # Load the 100x100x46 region centered at (center_x, center_y)
+        region_3d = load_3d_region(file_path, center_x, center_y, square_size)
+        if region_3d is None:
+            return None
+
+        # Extract the median pixels and the starting indices of the square region
+        median_x_full, median_y_full, start_x, start_y = median_pixels(aligned_data, center_x, center_y, square_size, percentage)
+
+        # Convert absolute coordinates to relative coordinates within the region_3d array
+        median_x_relative = median_x_full - start_x
+        median_y_relative = median_y_full - start_y
 
         # Initialize rolling average for this file
         rolling_avg = None
         num_pixels = 0
 
         # Use ProcessPoolExecutor with limited workers to reduce CPU usage
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=max_workers
-        ) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
             # Submit tasks for each pixel
             futures = [
-                executor.submit(
-                    process_pixel, file_path, median_10_x[i], median_10_y[i]
-                )
-                for i in range(len(median_10_x))
+                executor.submit(process_pixel, region_3d, x, y)
+                for x, y in zip(median_x_relative, median_y_relative)
             ]
 
             # Collect results as they complete
@@ -530,13 +533,9 @@ def process_file(file_path, square_size, percentage, max_workers):
                 if wavelength_data is not None:
                     # Update the rolling average
                     if rolling_avg is None:
-                        rolling_avg = (
-                            wavelength_data  # Initialize with the first spectrum
-                        )
+                        rolling_avg = wavelength_data  # Initialize with the first spectrum
                     else:
-                        rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (
-                            num_pixels + 1
-                        )
+                        rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (num_pixels + 1)
 
                     # Increment the number of pixels processed
                     num_pixels += 1
@@ -548,10 +547,38 @@ def process_file(file_path, square_size, percentage, max_workers):
         print(f"Error processing {file_path}: {str(e)}")
         return None
 
+def load_3d_region(file_path: str, center_x: int, center_y: int, square_size: int = 100):
+    """
+    Loads a 3D region (wavelength, x, y) from a .fits file centered at (center_x, center_y).
 
-def wavelength_calibration(
-    folder_path: str, square_size: int = 100, percentage: int = 1
-):
+    Args:
+        file_path (str): Path to the .fits file.
+        center_x (int): x-coordinate of the center of the region.
+        center_y (int): y-coordinate of the center of the region.
+        square_size (int): Size of the square region to extract (default is 100x100).
+
+    Returns:
+        np.ndarray: A 3D array of shape [wavelength, square_size, square_size].
+    """
+    try:
+        with fits.open(file_path, memmap=True) as hdul:
+            data = hdul[1].data  # Load the 3D data
+
+            # Calculate the bounds of the square region
+            half_size = square_size // 2
+            start_x = max(0, center_x - half_size)
+            end_x = min(data.shape[2], center_x + half_size)
+            start_y = max(0, center_y - half_size)
+            end_y = min(data.shape[1], center_y + half_size)
+
+            # Extract the 3D region
+            region_3d = data[:, start_y:end_y, start_x:end_x]
+            return region_3d
+    except Exception as e:
+        print(f"Error loading 3D region from {file_path}: {str(e)}")
+        return None
+
+def wavelength_calibration(folder_path: str, square_size: int = 100, percentage: int = 1):
     # Check if the AlignedImages folder exists
     aligned_folder = os.path.join(folder_path, "AlignedImages")
 
@@ -559,44 +586,72 @@ def wavelength_calibration(
         raise ValueError(f"AlignedImages folder not found in {folder_path}")
 
     # Get all aligned .fits files
-    aligned_files = [
-        f for f in os.listdir(aligned_folder) if f.lower().endswith(".fits")
-    ]
+    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith(".fits")]
 
     if not aligned_files:
         print("No aligned .fits files found in the AlignedImages folder.")
         return
 
+    # Load the reference spectrum (e.g., the first file)
+    ref_file = aligned_files[0]
+    ref_path = os.path.join(aligned_folder, ref_file)
+    ref_wavelengths = np.arange(400, 700, 0.1)  # Example reference wavelengths
+    ref_intensities = load_array(ref_path, "spectrum", x_coord=50, y_coord=50)  # Example reference intensities
+
     rolling_averages = []  # List to store rolling averages for each file
 
-    # Calculate the number of workers to use (80% of available CPU cores)
-    num_cores = psutil.cpu_count(logical=False)  # Physical cores
-    max_workers = max(1, int(num_cores * 0.8))  # Use 80% of available cores
-
-    # Process each file sequentially (outer loop)
+    # Process each file
     for file in aligned_files:
         file_path = os.path.join(aligned_folder, file)
-        result = process_file(file_path, square_size, percentage, max_workers)
+        result = process_file(file_path, square_size, percentage, max_workers=4)
         if result is not None:
-            rolling_averages.append(result)
+            file_name, target_intensities = result
+            target_wavelengths = np.arange(400, 700, 0.1)  # Example target wavelengths
+
+            # Align the target spectrum to the reference spectrum
+            aligned_intensities = align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities)
+
+            rolling_averages.append((file_name, aligned_intensities))
 
     # Plot the rolling averages for all files
     plt.figure(figsize=(10, 6))
     for file, spectrum in rolling_averages:
-        plt.plot(spectrum, label=file)  # Plot each spectrum with a label
+        plt.plot(ref_wavelengths, spectrum, label=file)  # Plot each spectrum with a label
 
-    plt.xlabel("Wavelength")
+    plt.xlabel("Wavelength (nm)")
     plt.ylabel("Intensity")
-    plt.title("Rolling Average Spectra for All Files")
+    plt.title("Rolling Average Spectra for All Files (Aligned)")
     plt.legend()
     plt.grid(True)
     plt.show()
-
 
 def wavelength_calibration_profiled():
     # The folder, and how wide the range of median pixels is (1% is 100 pixels)
     wavelength_calibration("TestImages", 100, 1)
 
+
+
+def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
+    """
+    Aligns the target spectrum to the reference spectrum using linear interpolation.
+
+    Args:
+        ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum.
+        ref_intensities (np.ndarray): Intensities of the reference spectrum.
+        target_wavelengths (np.ndarray): Wavelengths of the target spectrum.
+        target_intensities (np.ndarray): Intensities of the target spectrum.
+
+    Returns:
+        np.ndarray: Aligned intensities of the target spectrum at the reference wavelengths.
+    """
+    # Create an interpolation function for the target spectrum
+    interpolate_func = interp1d(target_wavelengths, target_intensities, kind='linear', fill_value="extrapolate")
+
+    # Evaluate the interpolation function at the reference wavelengths
+    aligned_intensities = interpolate_func(ref_wavelengths)
+
+    return aligned_intensities
+    
 
 ### Test Usage
 if __name__ == "__main__":
