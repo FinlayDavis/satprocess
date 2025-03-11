@@ -3,7 +3,6 @@ import csv
 import cProfile
 import pstats
 import concurrent.futures
-import psutil
 import astropy.io.fits as fits
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,7 +11,8 @@ from skimage.transform import hough_circle, hough_circle_peaks
 from skimage.feature import canny
 from skimage.filters import threshold_otsu
 from scipy.interpolate import interp1d
-from tkinter import *
+from scipy.signal import correlate
+
 
 # 0.024 A for pixel spectral resolution
 
@@ -71,7 +71,7 @@ def load_array(
     if not os.path.isfile(filename):
         raise FileNotFoundError(f"The file {filename} does not exist.")
 
-    with fits.open(filename) as hdul:
+    with fits.open(filename, menmap = True) as hdul:
         if len(hdul) < 2:
             raise IndexError(
                 "The .fits file does not contain the expected data extension."
@@ -160,9 +160,7 @@ def preprocess(image_array: np.ndarray) -> np.ndarray:
     return edges
 
 
-def hough_transform(
-    edges: np.ndarray, minrad: int = 800, maxrad: int = 1000
-) -> np.ndarray:
+def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) -> np.ndarray:
     """
     Performs the circular hough transform on the inputted 2D array, looking for circles in the specified size range.
 
@@ -175,18 +173,16 @@ def hough_transform(
         np.ndarray: An array containing all the found circles (hopefully just the one)
     """
     # Perform Circular Hough Transform for large circles
-    hough_radii = np.arange(
-        minrad, maxrad, 1
-    )  # Look for circle radii in the range 800-1000 (in the array, the radius of the sun is 925 for this file), with a step size of 3
+    hough_radii = np.arange(minrad, maxrad, 1)
     hough_res = hough_circle(edges, hough_radii)
 
     # Identify circles
-    accums, cx, cy, radii = hough_circle_peaks(
-        hough_res, hough_radii, total_num_peaks=1
-    )
+    accums, cx, cy, radii = hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
 
     identifiedCircles = np.array(list(zip(cx, cy, radii)))
+    print(f"Detected circles: {identifiedCircles}")  # Debug print
     return identifiedCircles
+
 
 
 # Somewhere in the code below is a memory leak? Or some sort of overload causing the following error:
@@ -314,6 +310,7 @@ def spatial_calibration(
         ref_edges = preprocess(ref_array)
         ref_circles = hough_transform(ref_edges, minrad, maxrad)
         ref_centroid = ref_circles[0][:2]
+        print(f"Reference centroid: {ref_centroid}")  # Debug print
     except Exception as e:
         raise RuntimeError(f"Reference processing failed: {str(e)}")
 
@@ -446,11 +443,11 @@ def median_pixels(
     median_x_full = x_coords + start_x
 
     # Plot the image with the square region and median pixels
-    plt.imshow(input_array, cmap="gray")
-    plt.scatter(median_x_full, median_y_full, c="red", s=2.5, label="Median Pixels")
-    plt.title("Square Region with Median Pixels")
-    plt.legend()
-    plt.show()
+    # plt.imshow(input_array, cmap="gray")
+    # plt.scatter(median_x_full, median_y_full, c="red", s=2.5, label="Median Pixels")
+    # plt.title("Square Region with Median Pixels")
+    # plt.legend()
+    # plt.show()
 
     return median_x_full, median_y_full, start_x, start_y
 
@@ -487,7 +484,7 @@ def process_file(file_path, square_size, percentage, max_workers):
         max_workers (int): Maximum number of parallel workers.
 
     Returns:
-        tuple: (file_path, rolling_average_spectrum)
+        tuple: (file_path, wavelengths, intensities)
     """
     try:
         # Load the aligned data and preprocess it
@@ -541,11 +538,15 @@ def process_file(file_path, square_size, percentage, max_workers):
                     num_pixels += 1
 
         print(f"Final rolling average for {file_path}: {rolling_avg}")
-        return file_path, rolling_avg
+
+        # Generate wavelengths (indices or actual wavelengths if available)
+        wavelengths = np.arange(len(rolling_avg))  # Use indices as wavelengths
+        return file_path, wavelengths, rolling_avg
 
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
         return None
+    
 
 def load_3d_region(file_path: str, center_x: int, center_y: int, square_size: int = 100):
     """
@@ -578,7 +579,16 @@ def load_3d_region(file_path: str, center_x: int, center_y: int, square_size: in
         print(f"Error loading 3D region from {file_path}: {str(e)}")
         return None
 
+
 def wavelength_calibration(folder_path: str, square_size: int = 100, percentage: int = 1):
+    """
+    Performs wavelength calibration by aligning spectra from all files to the first file's spectrum.
+
+    Args:
+        folder_path (str): Path to the folder containing aligned .fits files.
+        square_size (int): Size of the square region to extract.
+        percentage (int): Percentage of median pixels to use.
+    """
     # Check if the AlignedImages folder exists
     aligned_folder = os.path.join(folder_path, "AlignedImages")
 
@@ -592,66 +602,164 @@ def wavelength_calibration(folder_path: str, square_size: int = 100, percentage:
         print("No aligned .fits files found in the AlignedImages folder.")
         return
 
-    # Load the reference spectrum (e.g., the first file)
+    # Process the first file to use as the reference spectrum
     ref_file = aligned_files[0]
     ref_path = os.path.join(aligned_folder, ref_file)
-    ref_wavelengths = np.arange(400, 700, 0.1)  # Example reference wavelengths
-    ref_intensities = load_array(ref_path, "spectrum", x_coord=50, y_coord=50)  # Example reference intensities
+    print(f"Using {ref_file} as the reference spectrum.")
 
-    rolling_averages = []  # List to store rolling averages for each file
+    ref_result = process_file(ref_path, square_size, percentage, max_workers=4)
+    if ref_result is None:
+        print(f"Failed to process reference file {ref_file}. Exiting.")
+        return
 
-    # Process each file
-    for file in aligned_files:
+    ref_file_name, ref_wavelengths, ref_intensities = ref_result
+
+    # Store the reference spectrum
+    original_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
+    aligned_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
+
+    # Process the remaining files
+    for file in aligned_files[1:]:  # Skip the first file (already processed as reference)
         file_path = os.path.join(aligned_folder, file)
         result = process_file(file_path, square_size, percentage, max_workers=4)
         if result is not None:
-            file_name, target_intensities = result
-            target_wavelengths = np.arange(400, 700, 0.1)  # Example target wavelengths
+            file_name, target_wavelengths, target_intensities = result
+
+            # Save original spectrum
+            original_spectra.append((file_name, target_wavelengths, target_intensities))
 
             # Align the target spectrum to the reference spectrum
             aligned_intensities = align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities)
+            aligned_spectra.append((file_name, ref_wavelengths, aligned_intensities))
 
-            rolling_averages.append((file_name, aligned_intensities))
+            # Save the aligned spectrum to a new .fits file
+            save_aligned_spectrum(file_path, aligned_intensities, ref_wavelengths)
 
-    # Plot the rolling averages for all files
+    # Plot original spectra
     plt.figure(figsize=(10, 6))
-    for file, spectrum in rolling_averages:
-        plt.plot(ref_wavelengths, spectrum, label=file)  # Plot each spectrum with a label
-
+    for file, wavelengths, intensities in original_spectra:
+        plt.plot(wavelengths, intensities, label=file)
     plt.xlabel("Wavelength (nm)")
     plt.ylabel("Intensity")
-    plt.title("Rolling Average Spectra for All Files (Aligned)")
+    plt.title("Original Spectra")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(folder_path, "original_spectra.png"))
+    plt.close()
+
+    # Plot aligned spectra
+    plt.figure(figsize=(10, 6))
+    for file, wavelengths, intensities in aligned_spectra:
+        plt.plot(wavelengths, intensities, label=file)
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Intensity")
+    plt.title("Aligned Spectra")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(folder_path, "aligned_spectra.png"))
+    plt.close()
+
+    print(f"Plots saved in {folder_path}.")
+
+
+def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
+    """
+    Aligns the target spectrum to the reference spectrum using cross-correlation and interpolation.
+    """
+    # Plot the original spectra
+    plt.figure(figsize=(10, 6))
+    plt.plot(ref_wavelengths, ref_intensities, label="Reference Spectrum")
+    plt.plot(target_wavelengths, target_intensities, label="Target Spectrum")
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Intensity")
+    plt.title("Original Spectra")
     plt.legend()
     plt.grid(True)
     plt.show()
+
+    # Calculate the shift required to align the target spectrum to the reference spectrum
+    shift = calculate_spectral_shift(ref_intensities, target_intensities)
+
+    
+    if shift == 0:
+        print("Spectra are already aligned. No shift applied.")
+        return target_intensities  # Return the original target intensities
+    
+    # Shift the target spectrum
+    shifted_intensities = np.roll(target_intensities, shift)
+
+    # Create an interpolation function for the shifted target spectrum
+    interpolate_func = interp1d(target_wavelengths, shifted_intensities, kind='linear', fill_value="extrapolate")
+
+    # Interpolate shifted intensities onto the reference wavelength grid
+    aligned_intensities = interpolate_func(ref_wavelengths)
+
+    # Plot the aligned spectra
+    plt.figure(figsize=(10, 6))
+    plt.plot(ref_wavelengths, ref_intensities, label="Reference Spectrum")
+    plt.plot(ref_wavelengths, aligned_intensities, label="Aligned Target Spectrum")
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Intensity")
+    plt.title("Aligned Spectra")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    return aligned_intensities
+
+
+def normalize_spectrum(spectrum):
+    """
+    Normalize the spectrum to have zero mean and unit variance.
+    """
+    return (spectrum - np.mean(spectrum)) / np.std(spectrum)
+
+def calculate_spectral_shift(ref_intensities, target_intensities):
+    """
+    Calculates the shift required to align the target spectrum to the reference spectrum using cross-correlation.
+    """
+    # Normalize the spectra
+    ref_normalized = normalize_spectrum(ref_intensities)
+    target_normalized = normalize_spectrum(target_intensities)
+
+    # Use a larger subset of the spectra for cross-correlation
+    subset_size = min(len(ref_normalized), len(target_normalized))  # Use the full spectrum
+    ref_subset = ref_normalized[:subset_size]
+    target_subset = target_normalized[:subset_size]
+
+    # Calculate cross-correlation
+    correlation = correlate(ref_subset, target_subset, mode='full')
+    shift = np.argmax(correlation) - (len(ref_subset) - 1)
+
+    print(f"Cross-correlation result: {correlation}")  # Debug print
+    print(f"Calculated shift: {shift}")  # Debug print
+    return shift
+
+def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_wavelengths: np.ndarray):
+    """
+    Saves the aligned spectrum to a new .fits file.
+
+    Args:
+        file_path (str): Path to the original .fits file.
+        aligned_intensities (np.ndarray): Aligned intensities of the spectrum.
+        ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum.
+    """
+    os.path.join(file_path, "interpolated")
+    with fits.open(file_path) as hdul:
+        # Update the data with the aligned intensities
+        hdul[1].data = aligned_intensities
+
+        # Update the header with the new wavelength information
+        hdul[1].header["WAVE"] = (str(ref_wavelengths.tolist()), "Reference wavelengths")
+
+        # Save the new .fits file
+        new_file_path = file_path.replace(".fits", "_interpolated.fits")
+        hdul.writeto(new_file_path, overwrite=True)
 
 def wavelength_calibration_profiled():
     # The folder, and how wide the range of median pixels is (1% is 100 pixels)
     wavelength_calibration("TestImages", 100, 1)
 
-
-
-def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
-    """
-    Aligns the target spectrum to the reference spectrum using linear interpolation.
-
-    Args:
-        ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum.
-        ref_intensities (np.ndarray): Intensities of the reference spectrum.
-        target_wavelengths (np.ndarray): Wavelengths of the target spectrum.
-        target_intensities (np.ndarray): Intensities of the target spectrum.
-
-    Returns:
-        np.ndarray: Aligned intensities of the target spectrum at the reference wavelengths.
-    """
-    # Create an interpolation function for the target spectrum
-    interpolate_func = interp1d(target_wavelengths, target_intensities, kind='linear', fill_value="extrapolate")
-
-    # Evaluate the interpolation function at the reference wavelengths
-    aligned_intensities = interpolate_func(ref_wavelengths)
-
-    return aligned_intensities
-    
 
 ### Test Usage
 if __name__ == "__main__":
@@ -662,7 +770,7 @@ if __name__ == "__main__":
     try:
         # Perform spatial calibration and save aligned images
         # Directs to the folder path listed above, using a middle wavelength (40), starting at the first file and with a radius range of 200
-        aligned_images = spatial_calibration(folder_path, 40, shifts_file, 0, 800, 1000)
+        aligned_images = spatial_calibration(folder_path, 40, shifts_file, 0, 900, 950)
 
         if not aligned_images:
             print("No images processed successfully")
