@@ -231,14 +231,23 @@ def hough_transform_parallel(edges: np.ndarray, minrad: int = 800, maxrad: int =
 """
 
 
-def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int) -> np.ndarray:
+def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int, mode: str = "nearest") -> np.ndarray:
     """
     Transforms the inputted array by an x and y value.
+    \nOptions for input mode according to SciPy shift docs:
+    \n‘nearest’
+        The input is extended by replicating the last pixel.
+    \n‘constant’
+        The input is extended by filling all values beyond the edge with the same constant value,
+        defined by the cval parameter. No interpolation is performed beyond the edges of the input.
+    \n‘grid-wrap’
+        The input is extended by wrapping around to the opposite edge. Useful for preserving data.
 
     Args:
         dynArray (np.ndarray): The dynamic array to be transformed.
         shift_x (int): The x transform.
         shift_y (int): The y transform.
+        mode (str): The mode used for the spline interpolation transformation. Defaults to "nearest".
 
     Returns:
         np.ndarray: The transformed array.
@@ -666,16 +675,6 @@ def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_
     """
     Aligns the target spectrum to the reference spectrum using cross-correlation and interpolation.
     """
-    # Plot the original spectra
-    plt.figure(figsize=(10, 6))
-    plt.plot(ref_wavelengths, ref_intensities, label="Reference Spectrum")
-    plt.plot(target_wavelengths, target_intensities, label="Target Spectrum")
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title("Original Spectra")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
 
     # Calculate the shift required to align the target spectrum to the reference spectrum
     shift = calculate_spectral_shift(ref_intensities, target_intensities)
@@ -694,68 +693,7 @@ def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_
     # Interpolate shifted intensities onto the reference wavelength grid
     aligned_intensities = interpolate_func(ref_wavelengths)
 
-    # Plot the aligned spectra
-    plt.figure(figsize=(10, 6))
-    plt.plot(ref_wavelengths, ref_intensities, label="Reference Spectrum")
-    plt.plot(ref_wavelengths, aligned_intensities, label="Aligned Target Spectrum")
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title("Aligned Spectra")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
     return aligned_intensities
-
-"""def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
-
-Aligns the target spectrum to the reference spectrum using cross-correlation
-and applies sub-pixel interpolation-based shifting.
-
-# Calculate the shift required to align the target spectrum
-shift = calculate_spectral_shift(ref_intensities, target_intensities)
-
-if shift == 0:
-    print("Spectra are already aligned. No shift applied.")
-    return target_intensities  # Return original intensities if no shift
-
-# Apply sub-pixel shift
-shifted_intensities = subpixel_shift(target_intensities, shift, mode='nearest')
-
-# Interpolation to match reference wavelengths
-interpolate_func = interp1d(target_wavelengths, shifted_intensities, kind='linear', fill_value="extrapolate")
-aligned_intensities = interpolate_func(ref_wavelengths)
-
-return aligned_intensities
-
-def normalize_spectrum(spectrum):
-
-Normalize the spectrum to have zero mean and unit variance.
-
-return (spectrum - np.mean(spectrum)) / np.std(spectrum)
-
-def calculate_spectral_shift(ref_intensities, target_intensities):
-
-Calculates the fractional shift using cross-correlation.
-
-ref_normalized = normalize_spectrum(ref_intensities)
-target_normalized = normalize_spectrum(target_intensities)
-
-correlation = correlate(ref_normalized, target_normalized, mode='full')
-shift_index = np.argmax(correlation) - (len(ref_normalized) - 1)
-
-# Fit a quadratic curve around the peak for sub-pixel accuracy
-if 1 <= shift_index < len(correlation) - 1:
-    y0, y1, y2 = correlation[shift_index - 1], correlation[shift_index], correlation[shift_index + 1]
-    sub_pixel_correction = (y0 - y2) / (2 * (y0 - 2 * y1 + y2))  # Quadratic interpolation
-else:
-    sub_pixel_correction = 0  # Edge case, no sub-pixel correction possible
-
-shift = shift_index + sub_pixel_correction
-print(f"Calculated sub-pixel shift: {shift:.3f}")
-
-return shift
-"""
 
 def normalize_spectrum(spectrum):
     """
@@ -793,16 +731,17 @@ def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_w
         aligned_intensities (np.ndarray): Aligned intensities of the spectrum.
         ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum.
     """
-    os.path.join(file_path, "interpolated")
     with fits.open(file_path) as hdul:
         # Update the data with the aligned intensities
         hdul[1].data = aligned_intensities
 
         # Update the header with the new wavelength information
+
         hdul[1].header["WAVE"] = (str(ref_wavelengths.tolist()), "Reference wavelengths")
 
         # Save the new .fits file
         new_file_path = file_path.replace(".fits", "_interpolated.fits")
+        interp_file_path = os.path.join(new_file_path, "interpolated")
         hdul.writeto(new_file_path, overwrite=True)
 
 def wavelength_calibration_profiled():
