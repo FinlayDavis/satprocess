@@ -12,6 +12,7 @@ from skimage.feature import canny
 from skimage.filters import threshold_otsu
 from scipy.interpolate import interp1d
 from scipy.signal import correlate
+from scipy.ndimage import shift as subpixel_shift
 
 
 # 0.024 A for pixel spectral resolution
@@ -182,54 +183,6 @@ def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) ->
     identifiedCircles = np.array(list(zip(cx, cy, radii)))
     print(f"Detected circles: {identifiedCircles}")  # Debug print
     return identifiedCircles
-
-
-
-# Somewhere in the code below is a memory leak? Or some sort of overload causing the following error:
-# Critical error: Reference processing failed: [WinError 1450] Insufficient system resources exist to complete the requested service
-
-"""
-def process_radius_chunk(edges, radii):
-    ""Process a chunk of radii using the Hough transform.""
-    return hough_circle(edges, radii)
-
-def hough_transform_parallel(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000, num_workers: int = 4) -> np.ndarray:
-    ""
-    Performs the circular Hough transform on the inputted 2D array in parallel.
-
-    Args:
-        edges (np.ndarray): The 2D array containing the image data.
-        minrad (int): Minimum radius of identified circles.
-        maxrad (int): Maximum radius of identified circles.
-        num_workers (int): Number of parallel workers.
-
-    Returns:
-        np.ndarray: An array containing all the found circles.
-    ""
-    # Divide the radius range into chunks for parallel processing
-    radius_chunks = np.array_split(np.arange(minrad, maxrad), num_workers)
-    
-    # Use ProcessPoolExecutor to parallelize the Hough transform
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Submit tasks for each radius chunk
-        futures = [executor.submit(process_radius_chunk, edges, chunk) for chunk in radius_chunks]
-
-        # Collect results as they complete
-        hough_res_chunks = []
-        for future in concurrent.futures.as_completed(futures):
-            hough_res_chunks.append(future.result())
-
-    # Combine the results from all chunks
-    hough_res = np.concatenate(hough_res_chunks, axis=0)
-
-    # Identify circles
-    accums, cx, cy, radii = hough_circle_peaks(hough_res, np.arange(minrad, maxrad), total_num_peaks=1)
-
-    identified_circles = np.array(list(zip(cx, cy, radii)))
-    return identified_circles
-
-"""
-
 
 def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int) -> np.ndarray:
     """
@@ -662,34 +615,27 @@ def wavelength_calibration(folder_path: str, square_size: int = 100, percentage:
     print(f"Plots saved in {folder_path}.")
 
 
+
 def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
     """
-    Aligns the target spectrum to the reference spectrum using cross-correlation and interpolation.
+    Aligns the target spectrum to the reference spectrum using cross-correlation
+    and applies sub-pixel interpolation-based shifting.
     """
-
-    # Calculate the shift required to align the target spectrum to the reference spectrum
+    # Calculate the shift required to align the target spectrum
     shift = calculate_spectral_shift(ref_intensities, target_intensities)
-
+    
     if shift == 0:
         print("Spectra are already aligned. No shift applied.")
-        return target_intensities  # Return the original target intensities
-
-    # Apply a non-circular shift
-    if shift > 0:
-        # Shift to the right: pad with zeros at the beginning
-        shifted_intensities = np.concatenate([np.zeros(shift), target_intensities[:-shift]])
-    else:
-        # Shift to the left: pad with zeros at the end
-        shifted_intensities = np.concatenate([target_intensities[-shift:], np.zeros(-shift)])
-
-    # Create an interpolation function for the shifted target spectrum
+        return target_intensities  # Return original intensities if no shift
+    
+    # Apply sub-pixel shift
+    shifted_intensities = subpixel_shift(target_intensities, shift, mode='nearest')
+    
+    # Interpolation to match reference wavelengths
     interpolate_func = interp1d(target_wavelengths, shifted_intensities, kind='linear', fill_value="extrapolate")
-
-    # Interpolate shifted intensities onto the reference wavelength grid
     aligned_intensities = interpolate_func(ref_wavelengths)
-
+    
     return aligned_intensities
-
 
 def normalize_spectrum(spectrum):
     """
@@ -699,40 +645,31 @@ def normalize_spectrum(spectrum):
 
 def calculate_spectral_shift(ref_intensities, target_intensities):
     """
-    Calculates the shift required to align the target spectrum to the reference spectrum using cross-correlation.
+    Calculates the fractional shift using cross-correlation.
     """
-    # Normalize the spectra
     ref_normalized = normalize_spectrum(ref_intensities)
     target_normalized = normalize_spectrum(target_intensities)
+    
+    correlation = correlate(ref_normalized, target_normalized, mode='full')
+    shift_index = np.argmax(correlation) - (len(ref_normalized) - 1)
+    
+    # Fit a quadratic curve around the peak for sub-pixel accuracy
+    if 1 <= shift_index < len(correlation) - 1:
+        y0, y1, y2 = correlation[shift_index - 1], correlation[shift_index], correlation[shift_index + 1]
+        sub_pixel_correction = (y0 - y2) / (2 * (y0 - 2 * y1 + y2))  # Quadratic interpolation
+    else:
+        sub_pixel_correction = 0  # Edge case, no sub-pixel correction possible
+    
+    shift = shift_index + sub_pixel_correction
+    print(f"Calculated sub-pixel shift: {shift:.3f}")
 
-    # Use a larger subset of the spectra for cross-correlation
-    subset_size = min(len(ref_normalized), len(target_normalized))  # Use the full spectrum
-    ref_subset = ref_normalized[:subset_size]
-    target_subset = target_normalized[:subset_size]
-
-    # Calculate cross-correlation
-    correlation = correlate(ref_subset, target_subset, mode='full')
-    shift = np.argmax(correlation) - (len(ref_subset) - 1)
-
-    # Debugging: Plot the cross-correlation result
-    plt.figure(figsize=(10, 6))
-    plt.plot(correlation, label="Cross-correlation")
-    plt.axvline(x=len(ref_subset) - 1, color='r', linestyle='--', label="Zero Shift")
-    plt.xlabel("Shift")
-    plt.ylabel("Correlation")
-    plt.title("Cross-correlation Result")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-    print(f"Cross-correlation result: {correlation}")  # Debug print
-    print(f"Calculated shift: {shift}")  # Debug print
     return shift
 
 def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_wavelengths: np.ndarray):
     """
     Saves the aligned spectrum to a new .fits file.
 
+    
     Args:
         file_path (str): Path to the original .fits file.
         aligned_intensities (np.ndarray): Aligned intensities of the spectrum.
