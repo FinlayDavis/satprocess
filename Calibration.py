@@ -666,44 +666,27 @@ def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_
     """
     Aligns the target spectrum to the reference spectrum using cross-correlation and interpolation.
     """
-    # Plot the original spectra
-    plt.figure(figsize=(10, 6))
-    plt.plot(ref_wavelengths, ref_intensities, label="Reference Spectrum")
-    plt.plot(target_wavelengths, target_intensities, label="Target Spectrum")
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title("Original Spectra")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
 
     # Calculate the shift required to align the target spectrum to the reference spectrum
     shift = calculate_spectral_shift(ref_intensities, target_intensities)
 
-    
     if shift == 0:
         print("Spectra are already aligned. No shift applied.")
         return target_intensities  # Return the original target intensities
-    
-    # Shift the target spectrum
-    shifted_intensities = np.roll(target_intensities, shift)
+
+    # Apply a non-circular shift
+    if shift > 0:
+        # Shift to the right: pad with zeros at the beginning
+        shifted_intensities = np.concatenate([np.zeros(shift), target_intensities[:-shift]])
+    else:
+        # Shift to the left: pad with zeros at the end
+        shifted_intensities = np.concatenate([target_intensities[-shift:], np.zeros(-shift)])
 
     # Create an interpolation function for the shifted target spectrum
     interpolate_func = interp1d(target_wavelengths, shifted_intensities, kind='linear', fill_value="extrapolate")
 
     # Interpolate shifted intensities onto the reference wavelength grid
     aligned_intensities = interpolate_func(ref_wavelengths)
-
-    # Plot the aligned spectra
-    plt.figure(figsize=(10, 6))
-    plt.plot(ref_wavelengths, ref_intensities, label="Reference Spectrum")
-    plt.plot(ref_wavelengths, aligned_intensities, label="Aligned Target Spectrum")
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title("Aligned Spectra")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
 
     return aligned_intensities
 
@@ -731,6 +714,17 @@ def calculate_spectral_shift(ref_intensities, target_intensities):
     correlation = correlate(ref_subset, target_subset, mode='full')
     shift = np.argmax(correlation) - (len(ref_subset) - 1)
 
+    # Debugging: Plot the cross-correlation result
+    plt.figure(figsize=(10, 6))
+    plt.plot(correlation, label="Cross-correlation")
+    plt.axvline(x=len(ref_subset) - 1, color='r', linestyle='--', label="Zero Shift")
+    plt.xlabel("Shift")
+    plt.ylabel("Correlation")
+    plt.title("Cross-correlation Result")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
     print(f"Cross-correlation result: {correlation}")  # Debug print
     print(f"Calculated shift: {shift}")  # Debug print
     return shift
@@ -744,8 +738,19 @@ def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_w
         aligned_intensities (np.ndarray): Aligned intensities of the spectrum.
         ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum.
     """
-    os.path.join(file_path, "interpolated")
+    # Ensure the output directory exists
+    output_dir = os.path.join(os.path.dirname(file_path), "interpolated")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Create a new file path for the aligned spectrum
+    new_file_path = os.path.join(output_dir, os.path.basename(file_path).replace(".fits", "_interpolated.fits"))
+
+    # Read the original FITS file
     with fits.open(file_path) as hdul:
+        # Ensure the data is 3D
+        if len(hdul) < 2 or hdul[1].data.ndim != 3:
+            raise ValueError("The .fits file data is not 3D (expected [wavelength, x, y]).")
+
         # Update the data with the aligned intensities
         hdul[1].data = aligned_intensities
 
@@ -753,7 +758,6 @@ def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_w
         hdul[1].header["WAVE"] = (str(ref_wavelengths.tolist()), "Reference wavelengths")
 
         # Save the new .fits file
-        new_file_path = file_path.replace(".fits", "_interpolated.fits")
         hdul.writeto(new_file_path, overwrite=True)
 
 def wavelength_calibration_profiled():
