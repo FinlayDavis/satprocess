@@ -116,27 +116,73 @@ def load_array(
                 f"Invalid mode: {mode}. Options are 'full', 'slice', 'spectrum'."
             )
 
-
-def save_shifts(file_path: str, shifts: csv):
+def intensity_calibration(folder_path, square_size=100, percentage=1, minrad=800, maxrad=1000):
     """
-    Save alignment shifts to CSV with directory creation.
+    Perform intensity calibration by scaling spectra to match a reference spectrum.
+    """
+    aligned_folder = os.path.join(folder_path, "AlignedImages")
+    if not os.path.isdir(aligned_folder):
+        raise ValueError(f"AlignedImages folder not found in {folder_path}")
+
+    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith(".fits")]
+    if not aligned_files:
+        print("No aligned .fits files found in the AlignedImages folder.")
+        return
+
+    # Process the first file to use as the reference spectrum
+    ref_file = aligned_files[0]
+    ref_path = os.path.join(aligned_folder, ref_file)
+    print(f"Using {ref_file} as the reference spectrum.")
+
+    ref_result = process_file(ref_path, square_size, percentage, max_workers=4)
+    if ref_result is None:
+        print(f"Failed to process reference file {ref_file}. Exiting.")
+        return
+
+    ref_file_name, ref_wavelengths, ref_intensities = ref_result
+
+    # Store the reference spectrum
+    original_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
+    calibrated_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
+
+    # Process the remaining files
+    for file in aligned_files[1:]:  # Skip the first file (already processed as reference)
+        file_path = os.path.join(aligned_folder, file)
+        result = process_file(file_path, square_size, percentage)
+        if result is not None:
+            file_name, target_wavelengths, target_intensities = result
+
+            # Save original spectrum
+            original_spectra.append((file_name, target_wavelengths, target_intensities))
+
+            # Scale the target spectrum to match the reference spectrum
+            scaling_factor = np.median(ref_intensities) / np.median(target_intensities)
+            scaled_intensities = target_intensities * scaling_factor
+            calibrated_spectra.append((file_name, ref_wavelengths, scaled_intensities))
+
+            # Save the scaled spectrum to a new .fits file
+            save_scaled_spectrum(file_path, scaled_intensities, ref_wavelengths)
+
+    # Plot original spectra
+    plot_spectra(original_spectra, "Original Spectra", os.path.join(folder_path, "original_intensity_spectra.png"))
+
+    # Plot calibrated spectra
+    plot_spectra(calibrated_spectra, "Calibrated Spectra", os.path.join(folder_path, "calibrated_intensity_spectra.png"))
+
+def save_scaled_spectrum(file_path, scaled_intensities, wavelengths):
+    """
+    Save the scaled spectrum to a new .fits file.
 
     Args:
-        file_path (str): Folder location to save the .csv file in.
-        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference.
+        file_path (str): Path to the original .fits file.
+        scaled_intensities (np.ndarray): Scaled intensities of the spectrum.
+        wavelengths (np.ndarray): Wavelengths of the spectrum.
     """
-    directory = os.path.dirname(file_path)
-    if directory:  # Only create if path contains directories
-        os.makedirs(directory, exist_ok=True)
-    try:
-        with open(file_path, mode="w", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(["filename", "shift_y", "shift_x"])
-            for filename, (shift_y, shift_x) in shifts.items():
-                writer.writerow([filename, shift_y, shift_x])
-    except IOError as e:
-        print(f"Error saving shifts: {str(e)}")
-
+    with fits.open(file_path) as hdul:
+        hdul[1].data = scaled_intensities
+        hdul[1].header["SCALED"] = (True, "Intensity-scaled spectrum")
+        new_file_path = file_path.replace(".fits", "_scaled.fits")
+        hdul.writeto(new_file_path, overwrite=True)
 
 def preprocess(image_array: np.ndarray) -> np.ndarray:
     """
@@ -182,54 +228,6 @@ def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) ->
     identifiedCircles = np.array(list(zip(cx, cy, radii)))
     print(f"Detected circles: {identifiedCircles}")  # Debug print
     return identifiedCircles
-
-
-
-# Somewhere in the code below is a memory leak? Or some sort of overload causing the following error:
-# Critical error: Reference processing failed: [WinError 1450] Insufficient system resources exist to complete the requested service
-
-"""
-def process_radius_chunk(edges, radii):
-    ""Process a chunk of radii using the Hough transform.""
-    return hough_circle(edges, radii)
-
-def hough_transform_parallel(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000, num_workers: int = 4) -> np.ndarray:
-    ""
-    Performs the circular Hough transform on the inputted 2D array in parallel.
-
-    Args:
-        edges (np.ndarray): The 2D array containing the image data.
-        minrad (int): Minimum radius of identified circles.
-        maxrad (int): Maximum radius of identified circles.
-        num_workers (int): Number of parallel workers.
-
-    Returns:
-        np.ndarray: An array containing all the found circles.
-    ""
-    # Divide the radius range into chunks for parallel processing
-    radius_chunks = np.array_split(np.arange(minrad, maxrad), num_workers)
-    
-    # Use ProcessPoolExecutor to parallelize the Hough transform
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        # Submit tasks for each radius chunk
-        futures = [executor.submit(process_radius_chunk, edges, chunk) for chunk in radius_chunks]
-
-        # Collect results as they complete
-        hough_res_chunks = []
-        for future in concurrent.futures.as_completed(futures):
-            hough_res_chunks.append(future.result())
-
-    # Combine the results from all chunks
-    hough_res = np.concatenate(hough_res_chunks, axis=0)
-
-    # Identify circles
-    accums, cx, cy, radii = hough_circle_peaks(hough_res, np.arange(minrad, maxrad), total_num_peaks=1)
-
-    identified_circles = np.array(list(zip(cx, cy, radii)))
-    return identified_circles
-
-"""
-
 
 def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int, mode: str = "nearest") -> np.ndarray:
     """
@@ -451,13 +449,6 @@ def median_pixels(
     median_y_full = y_coords + start_y
     median_x_full = x_coords + start_x
 
-    # Plot the image with the square region and median pixels
-    # plt.imshow(input_array, cmap="gray")
-    # plt.scatter(median_x_full, median_y_full, c="red", s=2.5, label="Median Pixels")
-    # plt.title("Square Region with Median Pixels")
-    # plt.legend()
-    # plt.show()
-
     return median_x_full, median_y_full, start_x, start_y
 
 
@@ -644,32 +635,6 @@ def wavelength_calibration(folder_path: str, square_size: int = 100, percentage:
             # Save the aligned spectrum to a new .fits file
             save_aligned_spectrum(file_path, aligned_intensities, ref_wavelengths)
 
-    # Plot original spectra
-    plt.figure(figsize=(10, 6))
-    for file, wavelengths, intensities in original_spectra:
-        plt.plot(wavelengths, intensities, label=file)
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title("Original Spectra")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(folder_path, "original_spectra.png"))
-    plt.close()
-
-    # Plot aligned spectra
-    plt.figure(figsize=(10, 6))
-    for file, wavelengths, intensities in aligned_spectra:
-        plt.plot(wavelengths, intensities, label=file)
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title("Aligned Spectra")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(folder_path, "aligned_spectra.png"))
-    plt.close()
-
-    print(f"Plots saved in {folder_path}.")
-
 
 def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
     """
@@ -722,6 +687,49 @@ def calculate_spectral_shift(ref_intensities, target_intensities):
     print(f"Calculated shift: {shift}")  # Debug print
     return shift
 
+def plot_spectra(spectra, title, save_path):
+    """
+    Plot spectra and save the plot to a file.
+
+    Args:
+        spectra (list): List of tuples (file_name, wavelengths, intensities).
+        title (str): Title of the plot.
+        save_path (str): Path to save the plot.
+    """
+    plt.figure(figsize=(10, 6))
+    for file, wavelengths, intensities in spectra:
+        plt.plot(wavelengths, intensities, label=file)
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Intensity")
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(save_path)
+    plt.close()
+
+
+## SAVING FUNCTIONS
+
+def save_shifts(file_path: str, shifts: csv):
+    """
+    Save alignment shifts to CSV with directory creation.
+
+    Args:
+        file_path (str): Folder location to save the .csv file in.
+        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference.
+    """
+    directory = os.path.dirname(file_path)
+    if directory:  # Only create if path contains directories
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(file_path, mode="w", newline="") as file:
+            writer = csv.writer(file)
+            writer.writerow(["filename", "shift_y", "shift_x"])
+            for filename, (shift_y, shift_x) in shifts.items():
+                writer.writerow([filename, shift_y, shift_x])
+    except IOError as e:
+        print(f"Error saving shifts: {str(e)}")
+
 def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_wavelengths: np.ndarray):
     """
     Saves the aligned spectrum to a new .fits file.
@@ -740,13 +748,9 @@ def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_w
         hdul[1].header["WAVE"] = (str(ref_wavelengths.tolist()), "Reference wavelengths")
 
         # Save the new .fits file
-        new_file_path = file_path.replace(".fits", "_interpolated.fits")
+        new_file_path = file_path.replace(".fits", "_wave.fits")
         interp_file_path = os.path.join(new_file_path, "interpolated")
-        hdul.writeto(new_file_path, overwrite=True)
-
-def wavelength_calibration_profiled():
-    # The folder, and how wide the range of median pixels is (1% is 100 pixels)
-    wavelength_calibration("TestImages", 100, 1)
+        hdul.writeto(interp_file_path, overwrite=True)
 
 
 ### Test Usage
@@ -763,21 +767,8 @@ if __name__ == "__main__":
         if not aligned_images:
             print("No images processed successfully")
         else:
-
-            # Profile the function (Testing the timings on which process is slowest)
-            profiler = cProfile.Profile()
-            profiler.enable()
-
-            # This actually runs the wavelength calibration
-            wavelength_calibration_profiled()
-            profiler.disable()
-
-            # Write the profiling results to a file
-            with open("profile_stats.txt", "w") as f:
-                stats = pstats.Stats(profiler, stream=f)
-                stats.strip_dirs()
-                stats.sort_stats(pstats.SortKey.TIME)
-                stats.print_stats()
+            wavelength_calibration("TestImages", 100, 1)
+            intensity_calibration("TestImages", 100, 1, 900, 950)
 
     except Exception as e:
         print(f"Critical error: {str(e)}")
