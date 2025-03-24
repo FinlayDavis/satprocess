@@ -16,173 +16,6 @@ from scipy.signal import correlate
 
 # 0.024 A for pixel spectral resolution
 
-def load_shifts(file_path: str) -> dict:
-    """
-    Load existing shifts with error handling
-
-    Args:
-        file_path (str): Location of the shift.csv file.
-
-    Returns:
-        dict: The x/y shift values.
-    """
-    shifts = {}
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, mode="r") as file:
-                reader = csv.reader(file)
-                next(reader)  # Skip header
-                for row in reader:
-                    if len(row) >= 3:
-                        filename, shift_y, shift_x = (
-                            row[0],
-                            float(row[1]),
-                            float(row[2]),
-                        )
-                        shifts[filename] = (shift_y, shift_x)
-    except Exception as e:
-        print(f"Warning: Error loading shifts - {str(e)}")
-    return shifts
-
-
-def load_array(
-    filename: str,
-    mode: str = "full",
-    wavelength: int = None,
-    x_coord: int = None,
-    y_coord: int = None,
-) -> np.ndarray:
-    """
-    Loads data from the specified .fits file based on the mode.
-
-    Args:
-        filename (str): The name of the .fits file to be loaded.
-        mode (str): The mode of loading. Options: "full", "slice", "spectrum".
-        wavelength (int): The index of the wavelength to extract (required for "slice" mode).
-        x_coord (int): The x-coordinate of the pixel (required for "spectrum" mode).
-        y_coord (int): The y-coordinate of the pixel (required for "spectrum" mode).
-
-    Returns:
-        np.ndarray: The loaded data.
-
-    Raises:
-        ValueError: If the mode or parameters are invalid.
-    """
-    if not os.path.isfile(filename):
-        raise FileNotFoundError(f"The file {filename} does not exist.")
-
-    with fits.open(filename, menmap = True) as hdul:
-        if len(hdul) < 2:
-            raise IndexError(
-                "The .fits file does not contain the expected data extension."
-            )
-
-        data = hdul[1].data
-
-        if data.ndim != 3:
-            raise IndexError(
-                "The .fits file data is not 3D (expected [wavelength, x, y])."
-            )
-
-        if mode == "full":
-            return data
-        elif mode == "slice":
-            if wavelength is None:
-                raise ValueError("Wavelength must be specified for 'slice' mode.")
-            if wavelength < 0 or wavelength >= data.shape[0]:
-                raise ValueError(
-                    f"Wavelength index {wavelength} is out of bounds. "
-                    f"Valid range is 0 to {data.shape[0] - 1}."
-                )
-            return data[wavelength, :, :]
-        elif mode == "spectrum":
-            if x_coord is None or y_coord is None:
-                raise ValueError(
-                    "x_coord and y_coord must be specified for 'spectrum' mode."
-                )
-            if (
-                x_coord < 0
-                or x_coord >= data.shape[1]
-                or y_coord < 0
-                or y_coord >= data.shape[2]
-            ):
-                raise ValueError(
-                    f"Coordinates ({x_coord}, {y_coord}) are out of bounds. "
-                    f"Valid ranges are x: 0 to {data.shape[1] - 1}, y: 0 to {data.shape[2] - 1}."
-                )
-            return data[:, x_coord, y_coord]
-        else:
-            raise ValueError(
-                f"Invalid mode: {mode}. Options are 'full', 'slice', 'spectrum'."
-            )
-
-def intensity_calibration(folder_path, square_size=100, percentage=1, minrad=800, maxrad=1000):
-    """
-    Perform intensity calibration by scaling spectra to match a reference spectrum.
-    """
-    aligned_folder = os.path.join(folder_path, "AlignedImages")
-    if not os.path.isdir(aligned_folder):
-        raise ValueError(f"AlignedImages folder not found in {folder_path}")
-
-    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith(".fits")]
-    if not aligned_files:
-        print("No aligned .fits files found in the AlignedImages folder.")
-        return
-
-    # Process the first file to use as the reference spectrum
-    ref_file = aligned_files[0]
-    ref_path = os.path.join(aligned_folder, ref_file)
-    print(f"Using {ref_file} as the reference spectrum.")
-
-    ref_result = process_file(ref_path, square_size, percentage, max_workers=4)
-    if ref_result is None:
-        print(f"Failed to process reference file {ref_file}. Exiting.")
-        return
-
-    ref_file_name, ref_wavelengths, ref_intensities = ref_result
-
-    # Store the reference spectrum
-    original_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
-    calibrated_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
-
-    # Process the remaining files
-    for file in aligned_files[1:]:  # Skip the first file (already processed as reference)
-        file_path = os.path.join(aligned_folder, file)
-        result = process_file(file_path, square_size, percentage)
-        if result is not None:
-            file_name, target_wavelengths, target_intensities = result
-
-            # Save original spectrum
-            original_spectra.append((file_name, target_wavelengths, target_intensities))
-
-            # Scale the target spectrum to match the reference spectrum
-            scaling_factor = np.median(ref_intensities) / np.median(target_intensities)
-            scaled_intensities = target_intensities * scaling_factor
-            calibrated_spectra.append((file_name, ref_wavelengths, scaled_intensities))
-
-            # Save the scaled spectrum to a new .fits file
-            save_scaled_spectrum(file_path, scaled_intensities, ref_wavelengths)
-
-    # Plot original spectra
-    plot_spectra(original_spectra, "Original Spectra", os.path.join(folder_path, "original_intensity_spectra.png"))
-
-    # Plot calibrated spectra
-    plot_spectra(calibrated_spectra, "Calibrated Spectra", os.path.join(folder_path, "calibrated_intensity_spectra.png"))
-
-def save_scaled_spectrum(file_path, scaled_intensities, wavelengths):
-    """
-    Save the scaled spectrum to a new .fits file.
-
-    Args:
-        file_path (str): Path to the original .fits file.
-        scaled_intensities (np.ndarray): Scaled intensities of the spectrum.
-        wavelengths (np.ndarray): Wavelengths of the spectrum.
-    """
-    with fits.open(file_path) as hdul:
-        hdul[1].data = scaled_intensities
-        hdul[1].header["SCALED"] = (True, "Intensity-scaled spectrum")
-        new_file_path = file_path.replace(".fits", "_scaled.fits")
-        hdul.writeto(new_file_path, overwrite=True)
 
 def preprocess(image_array: np.ndarray) -> np.ndarray:
     """
@@ -206,7 +39,9 @@ def preprocess(image_array: np.ndarray) -> np.ndarray:
     return edges
 
 
-def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) -> np.ndarray:
+def hough_transform(
+    edges: np.ndarray, minrad: int = 800, maxrad: int = 1000
+) -> np.ndarray:
     """
     Performs the circular hough transform on the inputted 2D array, looking for circles in the specified size range.
 
@@ -223,13 +58,18 @@ def hough_transform(edges: np.ndarray, minrad: int = 800, maxrad: int = 1000) ->
     hough_res = hough_circle(edges, hough_radii)
 
     # Identify circles
-    accums, cx, cy, radii = hough_circle_peaks(hough_res, hough_radii, total_num_peaks=1)
+    accums, cx, cy, radii = hough_circle_peaks(
+        hough_res, hough_radii, total_num_peaks=1
+    )
 
     identifiedCircles = np.array(list(zip(cx, cy, radii)))
     print(f"Detected circles: {identifiedCircles}")  # Debug print
     return identifiedCircles
 
-def transform_array(dynArray: np.ndarray, shift_x: int, shift_y: int, mode: str = "nearest") -> np.ndarray:
+
+def transform_array(
+    dynArray: np.ndarray, shift_x: int, shift_y: int, mode: str = "nearest"
+) -> np.ndarray:
     """
     Transforms the inputted array by an x and y value.
     \nOptions for input mode according to SciPy shift docs:
@@ -265,33 +105,17 @@ def spatial_calibration(
 ):
     """
     Spatially calibrates all the .fits files in the input folder, referenced to the default file.
-
-    Args:
-        folder_path (str): The name of the folder which holds the .fits files.
-        wavelength (int): .fits files 3 axes, with the z axis being wavelength. This allows the user to choose which wavelenth. Defaults to 1.
-        shifts_file (str, optional): The name of the .csv file which stores the spatial offset values for each .fits file. Defaults to 'shifts.csv'.
-        default_file (int, optional): The file number which is used as the reference. Defaults to 0 (first file in the folder).
-        minrad (int, optional): Minumum radius of indentified circles. Defaults to 800.
-        maxrad (int, optional): Maximum radius of indentified circles. Defaults to 1000.
-
-    Returns:
-        list: A list containing the transformed images
-
-    Raises:
-        ValueError: Error raised if the file path doesn't exist (or isn't referenced properly)
-        RuntimeError: Error raised if the specified file path cannot be accessed
-        ValueError: Error raised if there are no files with the correct file extension at the location
-        ValueError: Error raised if the user specified "default file" is a number higher than the number of files
-        RuntimeError: Error raised if the reference file cannot be processed.
+    Saves aligned files in the "Spatial" folder.
     """
+    # Debug print
+    print("Starting spatial calibration...")
+
+    # Ensure the folder structure exists
+    ensure_folder_structure(folder_path)
 
     # Validate input directory
     if not os.path.isdir(folder_path):
         raise ValueError(f"Directory {folder_path} not found")
-
-    # Create the AlignedImages subfolder if it doesn't exist
-    aligned_folder = os.path.join(folder_path, "AlignedImages")
-    os.makedirs(aligned_folder, exist_ok=True)
 
     # Get files with multiple validation checks
     try:
@@ -313,6 +137,8 @@ def spatial_calibration(
     try:
         ref_file = files[default_file]
         ref_path = os.path.join(folder_path, ref_file)
+        print(f"Using {ref_file} as the reference spectrum.")
+
         ref_array = load_array(ref_path, "slice", wavelength)
         ref_edges = preprocess(ref_array)
         ref_circles = hough_transform(ref_edges, minrad, maxrad)
@@ -335,23 +161,23 @@ def spatial_calibration(
 
             # Calculate or load shifts
             if file in shifts:
-                shift_y, shift_x = shifts[file]
+                shift_y, shift_x, wavelength_shift = shifts[file]
             else:
                 file_circles = hough_transform(file_edges, minrad, maxrad)
                 file_centroid = file_circles[0][:2]
                 shift_x = ref_centroid[0] - file_centroid[0]
                 shift_y = ref_centroid[1] - file_centroid[1]
-                shifts[file] = (shift_y, shift_x)
+                wavelength_shift = 0  # Default value for wavelength shift
+                shifts[file] = (shift_y, shift_x, wavelength_shift)
 
             # Align and store
-            aligned = transform_array(file_array, *shifts[file])
+            aligned = transform_array(file_array, *shifts[file][:2])  # Use only shift_y and shift_x
             aligned_images.append((file, aligned))
 
-            # Save the aligned image as a new FITS file in the AlignedImages subfolder
+            # Save the aligned image as a new FITS file in the "Spatial" folder
+            
             if file.lower().endswith(".fits"):
-                new_file_name = f"{os.path.splitext(file)[0]}_aligned.fits"
-                new_file_path = os.path.join(aligned_folder, new_file_name)
-                save_aligned_fits(file_path, new_file_path, aligned, shift_x, shift_y)
+                save_aligned_fits(file_path, "Spatial", aligned, shift_x, shift_y)
 
         except Exception as e:
             print(f"Skipping {file} due to error: {str(e)}")
@@ -364,33 +190,6 @@ def spatial_calibration(
         print(f"Warning: Failed to save shifts - {str(e)}")
 
     return aligned_images
-
-
-def save_aligned_fits(
-    original_path: str, new_path: str, aligned_data, shift_x: float, shift_y: float
-):
-    """
-    Save the aligned data as a new FITS file with updated header information.
-
-    Args:
-        original_path (str): Path to the original FITS file.
-        new_path (str): Path to save the new aligned FITS file.
-        aligned_data: The aligned image data.
-        shift_x (float): The x-axis shift applied.
-        shift_y (float): The y-axis shift applied.
-    """
-    # Read the original FITS file
-    with fits.open(original_path) as hdul:
-        # Update the header with the shift information
-        hdul[0].header["SHIFT_X"] = (shift_x, "X-axis shift applied during alignment")
-        hdul[0].header["SHIFT_Y"] = (shift_y, "Y-axis shift applied during alignment")
-
-        # Replace the data with the aligned data
-        hdul[0].data = aligned_data
-
-        # Save the new FITS file
-        hdul.writeto(new_path, overwrite=True)
-
 
 def median_pixels(
     input_array: np.ndarray,
@@ -438,8 +237,12 @@ def median_pixels(
 
     # Calculate the range for the median percentage
     num_of_pixels = len(sorted_intensities)
-    med_start = int(num_of_pixels * (50 - percentage / 2) / 100)  # Start of median percentage
-    med_end = int(num_of_pixels * (50 + percentage / 2) / 100)    # End of median percentage
+    med_start = int(
+        num_of_pixels * (50 - percentage / 2) / 100
+    )  # Start of median percentage
+    med_end = int(
+        num_of_pixels * (50 + percentage / 2) / 100
+    )  # End of median percentage
 
     # Select the median percentage of pixels
     median_pixels_indices = sorted_indices[med_start:med_end]
@@ -471,7 +274,7 @@ def process_pixel(data_3d: np.ndarray, x: int, y: int):
     except Exception as e:
         print(f"Error processing pixel ({x}, {y}): {str(e)}")
         return None
-    
+
 
 def process_file(file_path, square_size, percentage, max_workers):
     """
@@ -487,6 +290,9 @@ def process_file(file_path, square_size, percentage, max_workers):
         tuple: (file_path, wavelengths, intensities)
     """
     try:
+        
+        if not os.path.exists(file_path):
+            raise SyntaxError(f"File not found: {file_path}")
         # Load the aligned data and preprocess it
         aligned_data = load_array(file_path, "slice", 1)
         edges = preprocess(aligned_data)
@@ -506,7 +312,9 @@ def process_file(file_path, square_size, percentage, max_workers):
             return None
 
         # Extract the median pixels and the starting indices of the square region
-        median_x_full, median_y_full, start_x, start_y = median_pixels(aligned_data, center_x, center_y, square_size, percentage)
+        median_x_full, median_y_full, start_x, start_y = median_pixels(
+            aligned_data, center_x, center_y, square_size, percentage
+        )
 
         # Convert absolute coordinates to relative coordinates within the region_3d array
         median_x_relative = median_x_full - start_x
@@ -517,7 +325,9 @@ def process_file(file_path, square_size, percentage, max_workers):
         num_pixels = 0
 
         # Use ProcessPoolExecutor with limited workers to reduce CPU usage
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
             # Submit tasks for each pixel
             futures = [
                 executor.submit(process_pixel, region_3d, x, y)
@@ -530,9 +340,13 @@ def process_file(file_path, square_size, percentage, max_workers):
                 if wavelength_data is not None:
                     # Update the rolling average
                     if rolling_avg is None:
-                        rolling_avg = wavelength_data  # Initialize with the first spectrum
+                        rolling_avg = (
+                            wavelength_data  # Initialize with the first spectrum
+                        )
                     else:
-                        rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (num_pixels + 1)
+                        rolling_avg = (rolling_avg * num_pixels + wavelength_data) / (
+                            num_pixels + 1
+                        )
 
                     # Increment the number of pixels processed
                     num_pixels += 1
@@ -546,9 +360,355 @@ def process_file(file_path, square_size, percentage, max_workers):
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
         return None
-    
 
-def load_3d_region(file_path: str, center_x: int, center_y: int, square_size: int = 100):
+
+def wavelength_calibration(folder_path: str, square_size: int = 100, percentage: int = 1):
+    """
+    Performs wavelength calibration by aligning spectra from all files to the first file's spectrum.
+    Saves all aligned files (including the reference) to the "Wavelength" folder with "_wave" suffix.
+    """
+    spatial_folder = os.path.join(folder_path, "AlignedImages", "Spatial")
+    
+    if not os.path.exists(spatial_folder):
+        print(f"Spatial folder not found: {spatial_folder}")
+        return
+
+    spatial_files = [
+        os.path.join(spatial_folder, f) 
+        for f in os.listdir(spatial_folder) 
+        if f.endswith(".fits")
+    ]
+    
+    if not spatial_files:
+        print("No files found in Spatial folder")
+        return
+
+    # Load existing shifts (if any)
+    shifts_file = os.path.join(folder_path, "shifts.csv")
+    shifts = load_shifts(shifts_file)
+
+    # Process the first file to use as the reference spectrum
+    ref_file = spatial_files[0]
+    print(f"Using {ref_file} as the reference spectrum.")
+
+    ref_result = process_file(ref_file, square_size, percentage, max_workers=4)
+    if ref_result is None:
+        print(f"Failed to process reference file {ref_file}. Exiting.")
+        return
+
+    ref_file_name, ref_wavelengths, ref_intensities = ref_result
+
+    # Save the reference spectrum to the Wavelength folder with "_wave" suffix
+    save_aligned_spectrum(ref_file, 0, ref_wavelengths)  # Shift=0 for reference
+
+    # Store the reference spectrum
+    original_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
+    aligned_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
+
+    # Process the remaining files
+    for file in spatial_files[1:]:
+        result = process_file(file, square_size, percentage, max_workers=4)
+        if result is not None:
+            file_name, target_wavelengths, target_intensities = result
+
+            # Save original spectrum
+            original_spectra.append((file_name, target_wavelengths, target_intensities))
+
+            # Check if the file already has a wavelength shift in the shifts dictionary
+            if file in shifts:
+                shift_y, shift_x, wavelength_shift = shifts[file]
+                print(f"Using existing wavelength shift for {file}: {wavelength_shift}")
+            else:
+                # Calculate the shift required to align the target spectrum to the reference spectrum
+                wavelength_shift = calculate_spectral_shift(ref_intensities, target_intensities)
+                print(f"Calculated wavelength shift for {file}: {wavelength_shift}")
+
+                # Update the shifts dictionary
+                if file in shifts:
+                    shift_y, shift_x = shifts[file]
+                else:
+                    shift_y, shift_x = 0, 0  # Default spatial shifts if not found
+                shifts[file] = (shift_y, shift_x, wavelength_shift)
+
+            # Align the target spectrum to the reference spectrum
+            aligned_intensities = align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities)
+            aligned_spectra.append((file_name, ref_wavelengths, aligned_intensities))
+
+            # Save the aligned spectrum to the Wavelength folder
+            save_aligned_spectrum(file, wavelength_shift, ref_wavelengths)
+
+    # Save the updated shifts to the CSV file
+    save_shifts(shifts_file, shifts)
+
+
+def align_spectrum(
+    ref_wavelengths, ref_intensities, target_wavelengths, target_intensities
+):
+    """
+    Aligns the target spectrum to the reference spectrum using cross-correlation and interpolation.
+    """
+
+    # Calculate the shift required to align the target spectrum to the reference spectrum
+    shift = calculate_spectral_shift(ref_intensities, target_intensities)
+
+    if shift == 0:
+        print("Spectra are already aligned. No shift applied.")
+        return target_intensities  # Return the original target intensities
+
+    # Shift the target spectrum
+    shifted_intensities = np.roll(target_intensities, shift)
+
+    # Create an interpolation function for the shifted target spectrum
+    interpolate_func = interp1d(
+        target_wavelengths, shifted_intensities, kind="linear", fill_value="extrapolate"
+    )
+
+    # Interpolate shifted intensities onto the reference wavelength grid
+    aligned_intensities = interpolate_func(ref_wavelengths)
+
+    return aligned_intensities
+
+
+def normalize_spectrum(spectrum):
+    """
+    Normalize the spectrum to have zero mean and unit variance.
+    """
+    return (spectrum - np.mean(spectrum)) / np.std(spectrum)
+
+
+def calculate_spectral_shift(ref_intensities, target_intensities):
+    """
+    Calculates the shift required to align the target spectrum to the reference spectrum using cross-correlation.
+    """
+    # Normalize the spectra
+    ref_normalized = normalize_spectrum(ref_intensities)
+    target_normalized = normalize_spectrum(target_intensities)
+
+    # Use a larger subset of the spectra for cross-correlation
+    subset_size = min(
+        len(ref_normalized), len(target_normalized)
+    )  # Use the full spectrum
+    ref_subset = ref_normalized[:subset_size]
+    target_subset = target_normalized[:subset_size]
+
+    # Calculate cross-correlation
+    correlation = correlate(ref_subset, target_subset, mode="full")
+    shift = np.argmax(correlation) - (len(ref_subset) - 1)
+
+    print(f"Cross-correlation result: {correlation}")  # Debug print
+    print(f"Calculated shift: {shift}")  # Debug print
+    return shift
+
+
+def plot_spectra(spectra, title, save_path):
+    plt.figure(figsize=(12, 6))
+    for file, wavelengths, intensities in spectra:
+        label = os.path.basename(file)  # Show only filename, not full path
+        plt.plot(wavelengths, intensities, label=label)
+    plt.xlabel("Wavelength (pixel index)")
+    plt.ylabel("Intensity (ADU)")
+    plt.title(title)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left")  # Avoid legend overlap
+    plt.tight_layout()
+    
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"Saved plot: {save_path}")
+
+
+def intensity_calibration(folder_path, square_size=100, percentage=1, minrad=800, maxrad=1000):
+    """Only processes files from Wavelength folder"""
+
+    wavelength_folder = os.path.join(folder_path, "AlignedImages", "Wavelength")
+    
+    if not os.path.exists(wavelength_folder):
+        print(f"Wavelength folder not found: {wavelength_folder}")
+        return
+
+    wavelength_files = [
+        os.path.join(wavelength_folder, f) 
+        for f in os.listdir(wavelength_folder) 
+        if f.endswith("_wave.fits")  # Only processed wavelength files
+    ]
+    
+    if not wavelength_files:
+        print("No wavelength-aligned files found")
+        return
+    
+    ensure_folder_structure(folder_path)
+
+    # Initialize storage for spectra
+    original_spectra = []
+    calibrated_spectra = []
+
+    # Process reference file
+    ref_file = wavelength_files[0]
+    print(f"Using {ref_file} as reference spectrum")
+    ref_result = process_file(ref_file, square_size, percentage, max_workers=4)
+    if not ref_result:
+        print("Failed to process reference file")
+        return
+    
+    ref_name, ref_wavelengths, ref_intensities = ref_result
+    original_spectra.append((ref_name, ref_wavelengths, ref_intensities))
+    calibrated_spectra.append((ref_name, ref_wavelengths, ref_intensities))
+
+    # Process target files
+    for file in wavelength_files[1:]:
+        print(f"\nProcessing {os.path.basename(file)}")
+        result = process_file(file, square_size, percentage, max_workers=4)
+        if not result:
+            print("Skipping - processing failed")
+            continue
+
+        file_name, target_wavelengths, target_intensities = result
+        original_spectra.append((file_name, target_wavelengths, target_intensities))
+
+        # Create masks ignoring zeros in BOTH spectra
+        ref_mask = (ref_intensities != 0)
+        target_mask = (target_intensities != 0)
+        valid_mask = ref_mask & target_mask
+
+        if not np.any(valid_mask):
+            print("Warning: No valid wavelength overlap (all zeros)")
+            scaling_factor = 1.0
+        else:
+            # Calculate scaling using only valid (non-zero) wavelengths
+            scaling_factor = np.median(
+                ref_intensities[valid_mask] / target_intensities[valid_mask]
+            )
+            print(f"Calculated scaling factor: {scaling_factor:.3f}")
+
+        # Apply scaling to ALL wavelengths (including zeros)
+        scaled_intensities = target_intensities * scaling_factor
+        calibrated_spectra.append((file_name, ref_wavelengths, scaled_intensities))
+        
+        # Save output
+        save_scaled_spectrum(file, scaled_intensities, ref_wavelengths)
+
+    # Generate plots
+    plot_spectra(
+        original_spectra,
+        "Original Spectra (Uncalibrated)", 
+        os.path.join(folder_path, "original_spectra.png")
+    )
+    plot_spectra(
+        calibrated_spectra,
+        "Calibrated Spectra (Intensity-Scaled)",
+        os.path.join(folder_path, "calibrated_spectra.png")
+    )
+
+
+## LOADING FUNCTIONS
+
+
+def load_shifts(file_path: str) -> dict:
+    """
+    Load existing shifts with error handling.
+
+    Args:
+        file_path (str): Location of the shift.csv file.
+
+    Returns:
+        dict: The x/y shift values and wavelength shift.
+              Format: {filename: (shift_y, shift_x, wavelength_shift)}
+    """
+    shifts = {}
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, mode="r") as file:
+                reader = csv.reader(file)
+                next(reader)  # Skip header
+                for row in reader:
+                    if len(row) >= 3:
+                        filename = row[0]
+                        shift_y = float(row[1])
+                        shift_x = float(row[2])
+                        # If wavelength_shift is missing, default to 0
+                        wavelength_shift = int(row[3]) if len(row) >= 4 else 0
+                        shifts[filename] = (shift_y, shift_x, wavelength_shift)
+    except Exception as e:
+        print(f"Warning: Error loading shifts - {str(e)}")
+    return shifts
+
+
+def load_array(
+    filename: str,
+    mode: str = "full",
+    wavelength: int = None,
+    x_coord: int = None,
+    y_coord: int = None,
+) -> np.ndarray:
+    """
+    Loads data from the specified .fits file based on the mode.
+
+    Args:
+        filename (str): The name of the .fits file to be loaded.
+        mode (str): The mode of loading. Options: "full", "slice", "spectrum".
+        wavelength (int): The index of the wavelength to extract (required for "slice" mode).
+        x_coord (int): The x-coordinate of the pixel (required for "spectrum" mode).
+        y_coord (int): The y-coordinate of the pixel (required for "spectrum" mode).
+
+    Returns:
+        np.ndarray: The loaded data.
+
+    Raises:
+        ValueError: If the mode or parameters are invalid.
+    """
+    if not os.path.isfile(filename):
+        raise FileNotFoundError(f"The file {filename} does not exist.")
+
+    with fits.open(filename, menmap=True) as hdul:
+        if len(hdul) < 2:
+            raise IndexError(
+                "The .fits file does not contain the expected data extension."
+            )
+
+        data = hdul[1].data
+
+        if data.ndim != 3:
+            raise IndexError(
+                "The .fits file data is not 3D (expected [wavelength, x, y])."
+            )
+
+        if mode == "full":
+            return data
+        elif mode == "slice":
+            if wavelength is None:
+                raise ValueError("Wavelength must be specified for 'slice' mode.")
+            if wavelength < 0 or wavelength >= data.shape[0]:
+                raise ValueError(
+                    f"Wavelength index {wavelength} is out of bounds. "
+                    f"Valid range is 0 to {data.shape[0] - 1}."
+                )
+            return data[wavelength, :, :]
+        elif mode == "spectrum":
+            if x_coord is None or y_coord is None:
+                raise ValueError(
+                    "x_coord and y_coord must be specified for 'spectrum' mode."
+                )
+            if (
+                x_coord < 0
+                or x_coord >= data.shape[1]
+                or y_coord < 0
+                or y_coord >= data.shape[2]
+            ):
+                raise ValueError(
+                    f"Coordinates ({x_coord}, {y_coord}) are out of bounds. "
+                    f"Valid ranges are x: 0 to {data.shape[1] - 1}, y: 0 to {data.shape[2] - 1}."
+                )
+            return data[:, x_coord, y_coord]
+        else:
+            raise ValueError(
+                f"Invalid mode: {mode}. Options are 'full', 'slice', 'spectrum'."
+            )
+
+
+def load_3d_region(
+    file_path: str, center_x: int, center_y: int, square_size: int = 100
+):
     """
     Loads a 3D region (wavelength, x, y) from a .fits file centered at (center_x, center_y).
 
@@ -580,143 +740,17 @@ def load_3d_region(file_path: str, center_x: int, center_y: int, square_size: in
         return None
 
 
-def wavelength_calibration(folder_path: str, square_size: int = 100, percentage: int = 1):
-    """
-    Performs wavelength calibration by aligning spectra from all files to the first file's spectrum.
-
-    Args:
-        folder_path (str): Path to the folder containing aligned .fits files.
-        square_size (int): Size of the square region to extract.
-        percentage (int): Percentage of median pixels to use.
-    """
-    # Check if the AlignedImages folder exists
-    aligned_folder = os.path.join(folder_path, "AlignedImages")
-
-    if not os.path.isdir(aligned_folder):
-        raise ValueError(f"AlignedImages folder not found in {folder_path}")
-
-    # Get all aligned .fits files
-    aligned_files = [f for f in os.listdir(aligned_folder) if f.lower().endswith(".fits")]
-
-    if not aligned_files:
-        print("No aligned .fits files found in the AlignedImages folder.")
-        return
-
-    # Process the first file to use as the reference spectrum
-    ref_file = aligned_files[0]
-    ref_path = os.path.join(aligned_folder, ref_file)
-    print(f"Using {ref_file} as the reference spectrum.")
-
-    ref_result = process_file(ref_path, square_size, percentage, max_workers=4)
-    if ref_result is None:
-        print(f"Failed to process reference file {ref_file}. Exiting.")
-        return
-
-    ref_file_name, ref_wavelengths, ref_intensities = ref_result
-
-    # Store the reference spectrum
-    original_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
-    aligned_spectra = [(ref_file_name, ref_wavelengths, ref_intensities)]
-
-    # Process the remaining files
-    for file in aligned_files[1:]:  # Skip the first file (already processed as reference)
-        file_path = os.path.join(aligned_folder, file)
-        result = process_file(file_path, square_size, percentage, max_workers=4)
-        if result is not None:
-            file_name, target_wavelengths, target_intensities = result
-
-            # Save original spectrum
-            original_spectra.append((file_name, target_wavelengths, target_intensities))
-
-            # Align the target spectrum to the reference spectrum
-            aligned_intensities = align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities)
-            aligned_spectra.append((file_name, ref_wavelengths, aligned_intensities))
-
-            # Save the aligned spectrum to a new .fits file
-            save_aligned_spectrum(file_path, aligned_intensities, ref_wavelengths)
-
-
-def align_spectrum(ref_wavelengths, ref_intensities, target_wavelengths, target_intensities):
-    """
-    Aligns the target spectrum to the reference spectrum using cross-correlation and interpolation.
-    """
-
-    # Calculate the shift required to align the target spectrum to the reference spectrum
-    shift = calculate_spectral_shift(ref_intensities, target_intensities)
-
-    
-    if shift == 0:
-        print("Spectra are already aligned. No shift applied.")
-        return target_intensities  # Return the original target intensities
-    
-    # Shift the target spectrum
-    shifted_intensities = np.roll(target_intensities, shift)
-
-    # Create an interpolation function for the shifted target spectrum
-    interpolate_func = interp1d(target_wavelengths, shifted_intensities, kind='linear', fill_value="extrapolate")
-
-    # Interpolate shifted intensities onto the reference wavelength grid
-    aligned_intensities = interpolate_func(ref_wavelengths)
-
-    return aligned_intensities
-
-def normalize_spectrum(spectrum):
-    """
-    Normalize the spectrum to have zero mean and unit variance.
-    """
-    return (spectrum - np.mean(spectrum)) / np.std(spectrum)
-
-def calculate_spectral_shift(ref_intensities, target_intensities):
-    """
-    Calculates the shift required to align the target spectrum to the reference spectrum using cross-correlation.
-    """
-    # Normalize the spectra
-    ref_normalized = normalize_spectrum(ref_intensities)
-    target_normalized = normalize_spectrum(target_intensities)
-
-    # Use a larger subset of the spectra for cross-correlation
-    subset_size = min(len(ref_normalized), len(target_normalized))  # Use the full spectrum
-    ref_subset = ref_normalized[:subset_size]
-    target_subset = target_normalized[:subset_size]
-
-    # Calculate cross-correlation
-    correlation = correlate(ref_subset, target_subset, mode='full')
-    shift = np.argmax(correlation) - (len(ref_subset) - 1)
-
-    print(f"Cross-correlation result: {correlation}")  # Debug print
-    print(f"Calculated shift: {shift}")  # Debug print
-    return shift
-
-def plot_spectra(spectra, title, save_path):
-    """
-    Plot spectra and save the plot to a file.
-
-    Args:
-        spectra (list): List of tuples (file_name, wavelengths, intensities).
-        title (str): Title of the plot.
-        save_path (str): Path to save the plot.
-    """
-    plt.figure(figsize=(10, 6))
-    for file, wavelengths, intensities in spectra:
-        plt.plot(wavelengths, intensities, label=file)
-    plt.xlabel("Wavelength (nm)")
-    plt.ylabel("Intensity")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(save_path)
-    plt.close()
-
-
 ## SAVING FUNCTIONS
 
-def save_shifts(file_path: str, shifts: csv):
+
+def save_shifts(file_path: str, shifts: dict):
     """
     Save alignment shifts to CSV with directory creation.
 
     Args:
         file_path (str): Folder location to save the .csv file in.
-        shifts (dict): The calculated coordinate difference between the center of this circle, and the center of the reference.
+        shifts (dict): The calculated coordinate difference and wavelength shift.
+                      Format: {filename: (shift_y, shift_x, wavelength_shift)}
     """
     directory = os.path.dirname(file_path)
     if directory:  # Only create if path contains directories
@@ -724,33 +758,171 @@ def save_shifts(file_path: str, shifts: csv):
     try:
         with open(file_path, mode="w", newline="") as file:
             writer = csv.writer(file)
-            writer.writerow(["filename", "shift_y", "shift_x"])
-            for filename, (shift_y, shift_x) in shifts.items():
-                writer.writerow([filename, shift_y, shift_x])
+            # Write column headings
+            writer.writerow(["filename", "shift_y", "shift_x", "wavelength_shift"])
+            # Write shift data
+            for filename, shift_values in shifts.items():
+                # Ensure shift_values has 3 elements
+                if len(shift_values) == 2:
+                    shift_y, shift_x = shift_values
+                    wavelength_shift = 0  # Default value for missing wavelength_shift
+                else:
+                    shift_y, shift_x, wavelength_shift = shift_values
+                writer.writerow([filename, shift_y, shift_x, wavelength_shift])
     except IOError as e:
         print(f"Error saving shifts: {str(e)}")
 
-def save_aligned_spectrum(file_path: str, aligned_intensities: np.ndarray, ref_wavelengths: np.ndarray):
+
+def save_aligned_fits(
+    original_path: str, new_folder: str, aligned_data, shift_x: float, shift_y: float
+):
     """
-    Saves the aligned spectrum to a new .fits file.
+    Save the spatially aligned data as a new FITS file in the specified folder.
+
+    Args:
+        original_path (str): Path to the original FITS file.
+        new_folder (str): Folder to save the new aligned FITS file (e.g., "Spatial").
+        aligned_data: The aligned image data.
+        shift_x (float): The x-axis shift applied.
+        shift_y (float): The y-axis shift applied.
+    """
+    # Create the new file path
+    path, file = os.path.split(original_path)
+    aligned_folder = os.path.join(path, "AlignedImages", new_folder)
+    os.makedirs(aligned_folder, exist_ok=True)
+    new_file_name = f"{os.path.splitext(os.path.basename(original_path))[0]}_aligned.fits"
+    new_file_path = os.path.join(aligned_folder, new_file_name)
+
+    # Debug print
+    print(f"Saving aligned file to: {new_file_path}")
+
+    # Read the original FITS file
+    with fits.open(original_path) as hdul:
+        # Update the header with the shift information
+        hdul[0].header["SHIFT_X"] = (shift_x, "X-axis shift applied during alignment")
+        hdul[0].header["SHIFT_Y"] = (shift_y, "Y-axis shift applied during alignment")
+
+        # Replace the data with the aligned data
+        hdul[0].data = aligned_data
+
+        # Save the new FITS file
+        hdul.writeto(new_file_path, overwrite=True)
+
+    # Debug print
+    print(f"File saved successfully: {new_file_path}")
+
+
+def save_aligned_spectrum(file_path: str, shift: int, ref_wavelengths: np.ndarray):
+    """
+    Saves the aligned spectrum to a new .fits file in the "Wavelength" folder.
 
     Args:
         file_path (str): Path to the original .fits file.
-        aligned_intensities (np.ndarray): Aligned intensities of the spectrum.
-        ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum.
+        shift (int): The calculated shift value (e.g., -3).
+        ref_wavelengths (np.ndarray): Wavelengths of the reference spectrum (1D array).
     """
+    # Create the new file path
+    aligned_folder = os.path.join(os.path.dirname(os.path.dirname(file_path)), "Wavelength")
+    os.makedirs(aligned_folder, exist_ok=True)
+    new_file_name = f"{os.path.splitext(os.path.basename(file_path))[0]}_wave.fits"
+    new_file_path = os.path.join(aligned_folder, new_file_name)
+
     with fits.open(file_path) as hdul:
-        # Update the data with the aligned intensities
-        hdul[1].data = aligned_intensities
+        # Ensure the original data is 3D
+        if hdul[1].data.ndim != 3:
+            raise ValueError(
+                "The original data must be 3D (expected [wavelength, x, y])."
+            )
+
+        # Create a copy of the original data to avoid modifying it directly
+        new_data = hdul[1].data.copy()
+
+        # Apply the shift to all pixels
+        new_data = np.roll(new_data, shift=shift, axis=0)  # Shift along the wavelength axis
+
+        # Replace the wrapped wavelengths with zeros
+        if shift < 0:
+            # If the shift is negative, the wrapped values are at the end
+            new_data[shift:, :, :] = 0  # Set the last `shift` wavelengths to zero
+        elif shift > 0:
+            # If the shift is positive, the wrapped values are at the beginning
+            new_data[:shift, :, :] = 0  # Set the first `shift` wavelengths to zero
+
+        # Update the data in the HDU
+        hdul[1].data = new_data
 
         # Update the header with the new wavelength information
-
-        hdul[1].header["WAVE"] = (str(ref_wavelengths.tolist()), "Reference wavelengths")
+        hdul[1].header["WAVE"] = (
+            str(ref_wavelengths.tolist()),
+            "Reference wavelengths",
+        )
+        hdul[1].header["SHIFT"] = (shift, "Wavelength shift applied during alignment")
 
         # Save the new .fits file
-        new_file_path = file_path.replace(".fits", "_wave.fits")
-        interp_file_path = os.path.join(new_file_path, "interpolated")
-        hdul.writeto(interp_file_path, overwrite=True)
+        hdul.writeto(new_file_path, overwrite=True)
+
+
+def save_scaled_spectrum(file_path, scaled_intensities, wavelengths):
+    """
+    Save the scaled spectrum to the "Intensity" folder with "_scaled.fits" suffix.
+    """
+    # Extract the base filename (e.g., "RSM20230207T001_FE_aligned_wave.fits")
+    original_filename = os.path.basename(file_path)
+    scaled_filename = original_filename.replace(".fits", "_scaled.fits")
+
+    # Create the output folder path
+    intensity_folder = os.path.join(
+        os.path.dirname(os.path.dirname(file_path)),  # Go up from Wavelength/Spatial
+        "Intensity"
+    )
+    os.makedirs(intensity_folder, exist_ok=True)
+
+    # Full output path
+    output_path = os.path.join(intensity_folder, scaled_filename)
+
+    # Save as new FITS file
+    with fits.open(file_path) as hdul:
+        hdul[1].data = scaled_intensities  # Replace data with scaled intensities
+        hdul[1].header["SCALED"] = (True, "Intensity-scaled spectrum")
+        hdul.writeto(output_path, overwrite=True)
+        print(f"Saved scaled spectrum to: {output_path}")
+
+## Folder Structure Logic
+
+def ensure_folder_structure(folder_path: str):
+    """
+    Ensures the required folder structure exists:
+    - TestImages/AlignedImages/Spatial
+    - TestImages/AlignedImages/Wavelength
+    - TestImages/AlignedImages/Intensity
+
+    Args:
+        folder_path (str): Path to the main folder (e.g., "TestImages").
+    """
+    aligned_folder = os.path.join(folder_path, "AlignedImages")
+    spatial_folder = os.path.join(aligned_folder, "Spatial")
+    wavelength_folder = os.path.join(aligned_folder, "Wavelength")
+    intensity_folder = os.path.join(aligned_folder, "Intensity")
+
+    # Create folders if they don't exist
+    os.makedirs(spatial_folder, exist_ok=True)
+    os.makedirs(wavelength_folder, exist_ok=True)
+    os.makedirs(intensity_folder, exist_ok=True)
+
+def find_files_in_order(folder_path: str, file_extension: str, search_order: list):
+    files = []
+    for folder_name in search_order:
+        search_folder = os.path.join(folder_path, "AlignedImages", folder_name)
+        if os.path.isdir(search_folder):
+            print(f"Searching in folder: {search_folder}")
+            folder_files = [
+                os.path.abspath(os.path.join(search_folder, f))  # Return absolute path
+                for f in os.listdir(search_folder)
+                if f.lower().endswith(file_extension)
+            ]
+            print(f"Found files: {folder_files}")
+            files.extend(folder_files)
+    return files
 
 
 ### Test Usage
