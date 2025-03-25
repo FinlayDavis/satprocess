@@ -147,28 +147,25 @@ def spatial_calibration(
     except Exception as e:
         raise RuntimeError(f"Reference processing failed: {str(e)}")
 
-    # Process all files
+
     for file in files:
         file_path = os.path.join(folder_path, file)
         try:
-            # Validate and load file
             if not os.path.isfile(file_path):
-                print(f"Skipping missing file: {file}")
                 continue
 
             file_array = load_array(file_path, "slice", wavelength)
             file_edges = preprocess(file_array)
 
-            # Calculate or load shifts
             if file in shifts:
-                shift_y, shift_x, wavelength_shift = shifts[file]
+                shift_y, shift_x, wavelength_shift, cx, cy = shifts[file]
             else:
                 file_circles = hough_transform(file_edges, minrad, maxrad)
-                file_centroid = file_circles[0][:2]
-                shift_x = ref_centroid[0] - file_centroid[0]
-                shift_y = ref_centroid[1] - file_centroid[1]
-                wavelength_shift = 0  # Default value for wavelength shift
-                shifts[file] = (shift_y, shift_x, wavelength_shift)
+                cx, cy, radius = file_circles[0]  # Get center coordinates
+                shift_x = ref_centroid[0] - cx
+                shift_y = ref_centroid[1] - cy
+                wavelength_shift = 0
+                shifts[file] = (shift_y, shift_x, wavelength_shift, cx, cy)  # Store center
 
             # Align and store
             aligned = transform_array(file_array, *shifts[file][:2])  # Use only shift_y and shift_x
@@ -290,21 +287,26 @@ def process_file(file_path, square_size, percentage, max_workers):
         tuple: (file_path, wavelengths, intensities)
     """
     try:
-        
         if not os.path.exists(file_path):
-            raise SyntaxError(f"File not found: {file_path}")
-        # Load the aligned data and preprocess it
-        aligned_data = load_array(file_path, "slice", 1)
-        edges = preprocess(aligned_data)
-        results = hough_transform(edges)
-
-        # Check if any circles were detected
-        if results.size == 0:
-            print(f"No circles detected in {file_path}. Skipping.")
-            return None
-
-        # Use the first detected circle
-        center_x, center_y, _ = results[0]
+            raise FileNotFoundError(f"File not found: {file_path}")
+            
+        # Check shifts.csv for existing center coordinates
+        shifts_file = os.path.join(os.path.dirname(os.path.dirname(file_path)), "shifts.csv")
+        shifts = load_shifts(shifts_file)
+        filename = os.path.basename(file_path)
+        
+        if filename in shifts:
+            _, _, _, center_x, center_y = shifts[filename]
+            print(f"Using pre-calculated center from shifts.csv: ({center_x}, {center_y})")
+        else:
+            # Fall back to Hough transform if no saved center
+            aligned_data = load_array(file_path, "slice", 1)
+            edges = preprocess(aligned_data)
+            results = hough_transform(edges)
+            if results.size == 0:
+                print(f"No circles detected in {file_path}")
+                return None
+            center_x, center_y, _ = results[0]
 
         # Load the 100x100x46 region centered at (center_x, center_y)
         region_3d = load_3d_region(file_path, center_x, center_y, square_size)
@@ -518,102 +520,76 @@ def plot_spectra(spectra, title, save_path):
     print(f"Saved plot: {save_path}")
 
 
-def intensity_calibration(folder_path, square_size=100, percentage=1, minrad=800, maxrad=1000):
-    """Only processes files from Wavelength folder"""
-
+def intensity_calibration(folder_path, square_size=100, percentage=1):
+    """Calibrate intensity and save reference to Intensity folder with _scaled suffix"""
     wavelength_folder = os.path.join(folder_path, "AlignedImages", "Wavelength")
-    
-    if not os.path.exists(wavelength_folder):
-        print(f"Wavelength folder not found: {wavelength_folder}")
-        return
-
-    wavelength_files = [
+    files = [
         os.path.join(wavelength_folder, f) 
         for f in os.listdir(wavelength_folder) 
-        if f.endswith("_wave.fits")  # Only processed wavelength files
+        if f.endswith("_wave.fits")
     ]
     
-    if not wavelength_files:
+    if not files:
         print("No wavelength-aligned files found")
         return
-    
-    ensure_folder_structure(folder_path)
 
-    # Initialize storage for spectra
-    original_spectra = []
-    calibrated_spectra = []
-
-    # Process reference file
-    ref_file = wavelength_files[0]
-    print(f"Using {ref_file} as reference spectrum")
+    # Process reference spectrum
+    ref_file = files[0]
     ref_result = process_file(ref_file, square_size, percentage, max_workers=4)
     if not ref_result:
         print("Failed to process reference file")
         return
     
     ref_name, ref_wavelengths, ref_intensities = ref_result
-    original_spectra.append((ref_name, ref_wavelengths, ref_intensities))
-    calibrated_spectra.append((ref_name, ref_wavelengths, ref_intensities))
+    ref_mask = (ref_intensities != 0)
+
+    # Save reference to Intensity folder (scale factor = 1.0)
+    save_scaled_spectrum(ref_file, ref_intensities, ref_wavelengths)
+    print(f"Saved reference spectrum to Intensity folder: {os.path.basename(ref_file).replace('.fits', '_scaled.fits')}")
+
+    # Store spectra for plotting
+    original_spectra = [(ref_name, ref_wavelengths, ref_intensities)]
+    calibrated_spectra = [(ref_name, ref_wavelengths, ref_intensities)]
 
     # Process target files
-    for file in wavelength_files[1:]:
-        print(f"\nProcessing {os.path.basename(file)}")
+    for file in files[1:]:
         result = process_file(file, square_size, percentage, max_workers=4)
         if not result:
-            print("Skipping - processing failed")
+            print(f"Skipping {file} - processing failed")
             continue
 
         file_name, target_wavelengths, target_intensities = result
         original_spectra.append((file_name, target_wavelengths, target_intensities))
-
-        # Create masks ignoring zeros in BOTH spectra
-        ref_mask = (ref_intensities != 0)
+        
+        # Create combined mask
         target_mask = (target_intensities != 0)
         valid_mask = ref_mask & target_mask
 
         if not np.any(valid_mask):
-            print("Warning: No valid wavelength overlap (all zeros)")
+            print(f"Warning: No valid wavelength overlap for {file_name}")
             scaling_factor = 1.0
         else:
-            # Calculate scaling using only valid (non-zero) wavelengths
-            scaling_factor = np.median(
-                ref_intensities[valid_mask] / target_intensities[valid_mask]
-            )
-            print(f"Calculated scaling factor: {scaling_factor:.3f}")
+            ref_integral = np.trapezoid(ref_intensities[valid_mask], ref_wavelengths[valid_mask])
+            target_integral = np.trapezoid(target_intensities[valid_mask], target_wavelengths[valid_mask])
+            scaling_factor = ref_integral / target_integral
 
-        # Apply scaling to ALL wavelengths (including zeros)
         scaled_intensities = target_intensities * scaling_factor
         calibrated_spectra.append((file_name, ref_wavelengths, scaled_intensities))
-        
-        # Save output
         save_scaled_spectrum(file, scaled_intensities, ref_wavelengths)
 
     # Generate plots
-    plot_spectra(
-        original_spectra,
-        "Original Spectra (Uncalibrated)", 
-        os.path.join(folder_path, "original_spectra.png")
-    )
-    plot_spectra(
-        calibrated_spectra,
-        "Calibrated Spectra (Intensity-Scaled)",
-        os.path.join(folder_path, "calibrated_spectra.png")
-    )
-
+    plot_spectra(original_spectra, "Original Spectra", 
+                os.path.join(folder_path, "original_spectra.png"))
+    plot_spectra(calibrated_spectra, "Calibrated Spectra", 
+                os.path.join(folder_path, "calibrated_spectra.png"))
 
 ## LOADING FUNCTIONS
 
 
 def load_shifts(file_path: str) -> dict:
     """
-    Load existing shifts with error handling.
-
-    Args:
-        file_path (str): Location of the shift.csv file.
-
-    Returns:
-        dict: The x/y shift values and wavelength shift.
-              Format: {filename: (shift_y, shift_x, wavelength_shift)}
+    Load shifts including circle centers.
+    Returns: {filename: (shift_y, shift_x, wavelength_shift, cx, cy)}
     """
     shifts = {}
     try:
@@ -622,13 +598,23 @@ def load_shifts(file_path: str) -> dict:
                 reader = csv.reader(file)
                 next(reader)  # Skip header
                 for row in reader:
-                    if len(row) >= 3:
-                        filename = row[0]
-                        shift_y = float(row[1])
-                        shift_x = float(row[2])
-                        # If wavelength_shift is missing, default to 0
-                        wavelength_shift = int(row[3]) if len(row) >= 4 else 0
-                        shifts[filename] = (shift_y, shift_x, wavelength_shift)
+                    if not row:  # Skip empty rows
+                        continue
+                        
+                    filename = row[0]
+                    try:
+                        # Safely extract values with defaults
+                        shift_y = float(row[1]) if len(row) > 1 else 0.0
+                        shift_x = float(row[2]) if len(row) > 2 else 0.0
+                        wavelength_shift = int(row[3]) if len(row) > 3 else 0
+                        cx = float(row[4]) if len(row) > 4 else 0.0
+                        cy = float(row[5]) if len(row) > 5 else 0.0
+                        
+                        shifts[filename] = (shift_y, shift_x, wavelength_shift, cx, cy)
+                    except (ValueError, IndexError) as e:
+                        print(f"Warning: Malformed row for {filename} - {str(e)}")
+                        shifts[filename] = (0.0, 0.0, 0, 0.0, 0.0)  # Default values
+                        
     except Exception as e:
         print(f"Warning: Error loading shifts - {str(e)}")
     return shifts
@@ -744,32 +730,19 @@ def load_3d_region(
 
 
 def save_shifts(file_path: str, shifts: dict):
-    """
-    Save alignment shifts to CSV with directory creation.
-
-    Args:
-        file_path (str): Folder location to save the .csv file in.
-        shifts (dict): The calculated coordinate difference and wavelength shift.
-                      Format: {filename: (shift_y, shift_x, wavelength_shift)}
-    """
-    directory = os.path.dirname(file_path)
-    if directory:  # Only create if path contains directories
-        os.makedirs(directory, exist_ok=True)
+    """Save shifts with all 5 values (shift_y, shift_x, wavelength_shift, cx, cy)"""
     try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
         with open(file_path, mode="w", newline="") as file:
             writer = csv.writer(file)
-            # Write column headings
-            writer.writerow(["filename", "shift_y", "shift_x", "wavelength_shift"])
-            # Write shift data
-            for filename, shift_values in shifts.items():
-                # Ensure shift_values has 3 elements
-                if len(shift_values) == 2:
-                    shift_y, shift_x = shift_values
-                    wavelength_shift = 0  # Default value for missing wavelength_shift
-                else:
-                    shift_y, shift_x, wavelength_shift = shift_values
-                writer.writerow([filename, shift_y, shift_x, wavelength_shift])
-    except IOError as e:
+            writer.writerow(["filename", "shift_y", "shift_x", "wavelength_shift", "cx", "cy"])
+            
+            for filename, values in shifts.items():
+                # Ensure we have all 5 values
+                full_values = list(values) + [0]*(5-len(values))
+                writer.writerow([filename] + full_values[:5])
+                
+    except Exception as e:
         print(f"Error saving shifts: {str(e)}")
 
 
@@ -940,7 +913,7 @@ if __name__ == "__main__":
             print("No images processed successfully")
         else:
             wavelength_calibration("TestImages", 100, 1)
-            intensity_calibration("TestImages", 100, 1, 900, 950)
+            intensity_calibration("TestImages", 100, 1)
 
     except Exception as e:
         print(f"Critical error: {str(e)}")
