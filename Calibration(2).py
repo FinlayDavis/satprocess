@@ -10,7 +10,7 @@ from skimage.feature import canny
 from skimage.filters import threshold_otsu
 from scipy.interpolate import interp1d
 from scipy.signal import correlate
-from typing import Dict, Tuple, Optional, List, Union
+from typing import Dict, Tuple, Optional, List
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,26 +18,39 @@ logger = logging.getLogger(__name__)
 
 # Shift Management Functions
 def clean_filename(filename: str) -> str:
-    """Strip alignment suffixes to get primary filename"""
+    """Function to remove appendages onto filenames, so that comparison accross calibrated files can be made.
+
+    Args:
+        filename (str): The filename to be cleaned.
+
+    Returns:
+        str: The cleaned filename
+    """
     suffixes = ['_aligned', '_wave', '_scaled', '_spatial']
     for suffix in suffixes:
         filename = filename.replace(suffix, '')
-    return os.path.splitext(filename)[0] + '.fits'  # Ensure .fits extension
+    return os.path.splitext(filename)[0] + '.fits'
 
 def load_shifts(shifts_file: str) -> Dict[str, Tuple]:
-    """Load shifts from CSV file, keeping only primary filenames"""
+    """Load in any known calibration values into a dictionary, to be modified throughout the code.
+
+    Args:
+        shifts_file (str): The name of the file to load.
+
+    Returns:
+        Dict[str, Tuple]: Returns a dict which associates the filename with the calibrated values.
+    """
     shifts = {}
     try:
         if os.path.exists(shifts_file):
             with open(shifts_file, mode="r") as file:
                 reader = csv.reader(file)
-                next(reader)  # Skip header
+                next(reader)
                 for row in reader:
                     if not row:
                         continue
                     filename = clean_filename(row[0])
                     try:
-                        # Ensure we have exactly 6 values (padding with defaults if needed)
                         values = [
                             float(row[1]) if len(row) > 1 else 0.0,   # shift_y
                             float(row[2]) if len(row) > 2 else 0.0,   # shift_x
@@ -55,7 +68,12 @@ def load_shifts(shifts_file: str) -> Dict[str, Tuple]:
     return shifts
 
 def save_shifts(shifts: Dict[str, Tuple], shifts_file: str):
-    """Save current shifts to file, maintaining only primary filenames"""
+    """Save the calibration values to the shifts.csv file.
+
+    Args:
+        shifts (Dict[str, Tuple]): The updated dict, with new calibration values.
+        shifts_file (str): The name of the file to be written to.
+    """
     try:
         os.makedirs(os.path.dirname(shifts_file), exist_ok=True)
         with open(shifts_file, mode="w", newline="") as file:
@@ -64,8 +82,7 @@ def save_shifts(shifts: Dict[str, Tuple], shifts_file: str):
                 "filename", "shift_y", "shift_x", "wavelength_shift", 
                 "cx", "cy", "intensity_scaling"
             ])
-            
-            # Sort by filename for consistent ordering
+        
             for filename in sorted(shifts.keys()):
                 values = shifts[filename]
                 writer.writerow([filename] + list(values))
@@ -73,12 +90,25 @@ def save_shifts(shifts: Dict[str, Tuple], shifts_file: str):
         logger.error(f"Error saving shifts: {str(e)}")
 
 def get_shifts(shifts: Dict[str, Tuple], filename: str) -> Tuple:
-    """Get shifts for a file (using cleaned filename) with defaults"""
+    """Outputs the calibration values for a specific file, independent of the appended names.
+
+    Args:
+        shifts (Dict[str, Tuple]): Full calibration shift dictionary.
+        filename (str): The name of the file for which the calibration values are required.
+
+    Returns:
+        Tuple: The current calibration values associated with that filename.
+    """
     clean_name = clean_filename(filename)
     return shifts.get(clean_name, (0.0, 0.0, 0, 0.0, 0.0, 1.0))
 
 def update_shifts(shifts: Dict[str, Tuple], filename: str, **updates):
-    """Update specific shift values for a file (using cleaned filename)"""
+    """Update calibration values in the shifts dictionary, depending on which values have been changed.
+
+    Args:
+        shifts (Dict[str, Tuple]): Full calibration shift dictionary.
+        filename (str): The name of the file which will have the calibration values changed.
+    """
     clean_name = clean_filename(filename)
     current = list(get_shifts(shifts, clean_name))
     fields = ['shift_y', 'shift_x', 'wavelength_shift', 'cx', 'cy', 'intensity_scaling']
@@ -92,13 +122,29 @@ def update_shifts(shifts: Dict[str, Tuple], filename: str, **updates):
 
 # FITS Processing Functions
 def ensure_folder_structure(base_path: str):
-    """Create required folder structure"""
+    """Creates the appropriate folder structure the code needs, if it doesn't exist already.
+
+    Args:
+        base_path (str): The parent directory where the subfolders are created.
+    """
     folders = ["Spatial", "Wavelength", "Intensity"]
     for folder in folders:
         os.makedirs(os.path.join(base_path, "AlignedImages", folder), exist_ok=True)
 
 def load_fits(file_path: str, mode: str = "full", **kwargs) -> np.ndarray:
-    """Load data from FITS file with different modes"""
+    """Loads in the specified .fits file, in the mode required, with possible inputs for wavelength or coordinates.
+
+    Args:
+        file_path (str): _description_
+        mode (str, optional): _description_. Defaults to "full".
+
+    Raises:
+        FileNotFoundError: _description_
+        ValueError: _description_
+
+    Returns:
+        np.ndarray: _description_
+    """
     if not os.path.isfile(file_path):
         raise FileNotFoundError(f"File {file_path} not found")
 
@@ -191,6 +237,126 @@ def find_matching_ha_file(fe_file: str) -> Optional[str]:
         return os.path.join(os.path.dirname(fe_file), ha_file)
     return None
 
+def apply_calibrations_to_ha_files(
+    folder_path: str,
+    shifts: Dict[str, Tuple],
+    alignment_wavelength: int = 1,
+    overwrite: bool = False,
+    plot_spectra: bool = True
+) -> List[str]:
+    """Apply existing calibrations to matching H-alpha files (sequential version)"""
+    logger.info("Applying calibrations to H-alpha files...")
+    
+    fe_files = [f for f in os.listdir(folder_path) if f.upper().endswith('_FE.FITS')]
+    if not fe_files:
+        raise ValueError("No Fe FITS files found to use as reference")
+
+    # Prepare for plotting
+    if plot_spectra:
+        original_spectra = []
+        aligned_spectra = []
+        plot_dir = os.path.join(folder_path, "plots", "ha_calibration")
+        os.makedirs(plot_dir, exist_ok=True)
+
+    processed_files = []
+    
+    for fe_file in fe_files:
+        fe_path = os.path.join(folder_path, fe_file)
+        ha_path = find_matching_ha_file(fe_path)
+        
+        if not ha_path or not os.path.exists(ha_path):
+            logger.warning(f"No matching H-alpha file found for {fe_file}")
+            continue
+
+        try:
+            # Get original spectrum for plotting
+            if plot_spectra:
+                try:
+                    original_data = load_fits(ha_path, mode="full")
+                    if original_data.ndim == 3:
+                        # For 3D data, take the specified wavelength slice
+                        original_spec = original_data[alignment_wavelength]
+                        # If the slice is still 2D, take mean or median
+                        if original_spec.ndim == 2:
+                            original_spec = np.median(original_spec, axis=0)  # Or np.mean(original_spec, axis=0)
+                        wavelengths = np.arange(len(original_spec))
+                        original_spectra.append((ha_path, wavelengths, original_spec))
+                    elif original_data.ndim == 2:
+                        # For 2D data, take median row
+                        original_spec = np.median(original_data, axis=0)
+                        wavelengths = np.arange(len(original_spec))
+                        original_spectra.append((ha_path, wavelengths, original_spec))
+                    else:
+                        logger.warning(f"Unexpected data dimensions {original_data.ndim} in {ha_path}")
+                except Exception as e:
+                    logger.error(f"Couldn't prepare original spectrum for {ha_path}: {str(e)}", exc_info=True)
+
+            # Get shifts from corresponding Fe file
+            base_name = os.path.splitext(os.path.basename(fe_path))[0] + '.fits'
+            current_shifts = get_shifts(shifts, base_name)
+            shift_y, shift_x, wavelength_shift, cx, cy, intensity_scaling = current_shifts
+
+            # Load H-alpha cube
+            ha_cube = load_fits(ha_path, mode="full")
+            
+            # Apply spatial shift
+            aligned_cube = np.zeros_like(ha_cube)
+            for i in range(ha_cube.shape[0]):
+                aligned_cube[i] = transform_image(ha_cube[i], shift_x, shift_y)
+            
+            # Apply wavelength shift if needed
+            if wavelength_shift != 0 and aligned_cube.ndim == 3:
+                aligned_cube = np.roll(aligned_cube, wavelength_shift, axis=0)
+                if wavelength_shift < 0:
+                    aligned_cube[wavelength_shift:] = 0
+                elif wavelength_shift > 0:
+                    aligned_cube[:wavelength_shift] = 0
+            
+            # Apply intensity scaling
+            scaled_cube = aligned_cube * intensity_scaling
+            
+            # Save processed H-alpha file
+            saved_path = save_processed(
+                ha_path,
+                folder_path,
+                "spatial",
+                scaled_cube,
+                "_aligned",
+                {
+                    'SPATIAL': ('CALIBRATED', 'Spatial calibration applied'),
+                    'SHIFT_X': (shift_x, 'X shift (pixels)'),
+                    'SHIFT_Y': (shift_y, 'Y shift (pixels)'),
+                    'WAVESHFT': (wavelength_shift, 'Wavelength shift'),
+                    'SCALE_FC': (intensity_scaling, 'Intensity scaling factor'),
+                    'REF_FILE': (fe_file, 'Reference Fe file')
+                }
+            )
+            processed_files.append(saved_path)
+
+            # Get aligned spectrum for plotting
+            if plot_spectra:
+                try:
+                    if scaled_cube.ndim == 3:
+                        aligned_spec = scaled_cube[alignment_wavelength]
+                        if aligned_spec.ndim == 2:
+                            aligned_spec = np.median(aligned_spec, axis=0)
+                        wavelengths = np.arange(len(aligned_spec))
+                        aligned_spectra.append((saved_path, wavelengths, aligned_spec))
+                    elif scaled_cube.ndim == 2:
+                        aligned_spec = np.median(scaled_cube, axis=0)
+                        wavelengths = np.arange(len(aligned_spec))
+                        aligned_spectra.append((saved_path, wavelengths, aligned_spec))
+                    else:
+                        logger.warning(f"Unexpected data dimensions {scaled_cube.ndim} in {saved_path}")
+                except Exception as e:
+                    logger.error(f"Couldn't prepare aligned spectrum for {saved_path}: {str(e)}", exc_info=True)
+            
+        except Exception as e:
+            logger.error(f"Failed to process {ha_path}: {str(e)}", exc_info=True)
+            continue
+
+    return processed_files
+
 # Image Processing Functions
 def preprocess_image(image: np.ndarray, sigma: float = 2) -> np.ndarray:
     """Prepare image for circle detection"""
@@ -199,11 +365,39 @@ def preprocess_image(image: np.ndarray, sigma: float = 2) -> np.ndarray:
     binary = blurred > thresh
     return canny(binary, sigma=1)
 
-def detect_circles(edges: np.ndarray, min_radius: int = 800, max_radius: int = 1000) -> np.ndarray:
-    """Detect circles using Hough transform"""
+def detect_circles(
+    edges: np.ndarray, 
+    min_radius: Optional[int] = None, 
+    max_radius: Optional[int] = None,
+    reference_radius: Optional[int] = None,
+    margin_percent: float = 2.0
+) -> np.ndarray:
+    """Detect circles using Hough transform with adaptive radius range.
+    
+    Args:
+        edges: Edge detection result
+        min_radius: Minimum circle radius (optional)
+        max_radius: Maximum circle radius (optional)
+        reference_radius: Previously detected radius for adaptive range
+        margin_percent: Percentage margin around reference radius
+        
+    Returns:
+        Array of detected circles (cx, cy, radius)
+    """
+    # Use adaptive range if reference radius is provided
+    if reference_radius is not None:
+        margin = reference_radius * margin_percent / 100
+        min_radius = int(reference_radius - margin)
+        max_radius = int(reference_radius + margin)
+    else:
+        # Default wide range if no reference
+        min_radius = min_radius or 500
+        max_radius = max_radius or 1500
+    
     radii = np.arange(min_radius, max_radius, 1)
     hough_res = hough_circle(edges, radii)
     accums, cx, cy, radii = hough_circle_peaks(hough_res, radii, total_num_peaks=1)
+    
     return np.array(list(zip(cx, cy, radii)))
 
 def transform_image(image: np.ndarray, dx: float, dy: float, mode: str = "nearest") -> np.ndarray:
@@ -271,24 +465,34 @@ def calculate_scaling(ref_spec: np.ndarray, target_spec: np.ndarray) -> float:
     target_integral = np.trapezoid(target_spec[mask])
     return ref_integral / target_integral if target_integral != 0 else 1.0
 
-# Plotting Functions
 def plot_spectra(
     spectra_data: List[Tuple[str, np.ndarray, np.ndarray]], 
     title: str,
     save_path: str,
-    figsize: Tuple[int, int] = (12, 6)
+    figsize: Tuple[int, int] = (12, 6),
+    normalize: bool = False
 ):
     """
-    Plot multiple spectra on the same figure
+    Plot multiple spectra on the same figure with optional normalization
     
     Args:
         spectra_data: List of (filename, wavelengths, intensities) tuples
         title: Plot title
         save_path: Where to save the plot
         figsize: Figure dimensions
+        normalize: Whether to normalize spectra to [0,1] range
     """
     plt.figure(figsize=figsize)
+    
     for file_path, wavelengths, intensities in spectra_data:
+        # Handle multi-dimensional data
+        if intensities.ndim > 1:
+            intensities = intensities.mean(axis=tuple(range(1, intensities.ndim)))
+        
+        # Optional normalization
+        if normalize:
+            intensities = (intensities - np.min(intensities)) / (np.max(intensities) - np.min(intensities))
+        
         label = os.path.basename(file_path)
         plt.plot(wavelengths, intensities, label=label)
     
@@ -374,28 +578,32 @@ def spatial_calibration(
     shifts: Dict[str, Tuple],
     alignment_wavelength: int = 1,
     reference_index: int = 0,
-    min_radius: int = 800,
-    max_radius: int = 1000
+    wide_min_radius: int = 500,
+    wide_max_radius: int = 1500,
+    tight_margin_percent: float = 2.0,
+    mode: str = "fe_only"
 ) -> List[str]:
-    """Perform spatial alignment of all images"""
-    logger.info("Starting spatial calibration...")
+    """Perform spatial alignment with automatic adaptive circle detection.
     
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith('.fits')]
+    The reference file uses wide bounds, then subsequent files use tight bounds
+    based on the reference's detected radius.
+    """
+    logger.info(f"Starting adaptive spatial calibration in {mode} mode...")
+    
+    # Get files based on mode
+    files = [f for f in os.listdir(folder_path) 
+             if f.lower().endswith('_fe.fits' if mode == "fe_only" else '.fits')]
+    
     if not files:
-        raise ValueError("No FITS files found")
+        raise ValueError("No FITS files found matching mode criteria")
     if reference_index >= len(files):
         raise ValueError("Invalid reference index")
 
-    # Process reference image
-    ref_path = os.path.join(folder_path, files[reference_index])
-    ref_slice = load_fits(ref_path, mode="slice", wavelength=alignment_wavelength)
-    ref_edges = preprocess_image(ref_slice)
-    ref_circles = detect_circles(ref_edges, min_radius, max_radius)
-    ref_center = ref_circles[0][:2]
-    logger.info(f"Reference center: {ref_center}")
-
+    # Track reference radius for adaptive detection
+    reference_radius = None
     aligned_files = []
-    for file in files:
+
+    for i, file in enumerate(files):
         file_path = os.path.join(folder_path, file)
         try:
             base_name = os.path.splitext(file)[0] + '.fits'
@@ -403,25 +611,43 @@ def spatial_calibration(
             
             # Load alignment slice
             alignment_slice = load_fits(file_path, mode="slice", wavelength=alignment_wavelength)
+            edges = preprocess_image(alignment_slice)
             
-            # Calculate or use existing shifts
-            if current_shifts[3:5] != (0.0, 0.0):  # If center exists
-                cx, cy = current_shifts[3:5]
-                shift_x = ref_center[0] - cx
-                shift_y = ref_center[1] - cy
+            # Determine search strategy
+            if i == reference_index:
+                # First pass: wide search for reference file
+                logger.info(f"Performing initial wide search on reference file {file}")
+                circles = detect_circles(edges, wide_min_radius, wide_max_radius)
+                reference_radius = circles[0][2]
+                logger.info(f"Reference radius found: {reference_radius} pixels")
             else:
-                edges = preprocess_image(alignment_slice)
-                circles = detect_circles(edges, min_radius, max_radius)
-                cx, cy, _ = circles[0]
+                # Adaptive search for subsequent files
+                if reference_radius is None:
+                    raise RuntimeError("Reference radius not established")
+                
+                margin = reference_radius * tight_margin_percent / 100
+                min_r = int(reference_radius - margin)
+                max_r = int(reference_radius + margin)
+                logger.debug(f"Using adaptive bounds: {min_r}-{max_r} pixels")
+                circles = detect_circles(edges, min_r, max_r)
+            
+            cx, cy, radius = circles[0]
+            
+            # For non-reference files, calculate shifts relative to reference
+            if i == reference_index:
+                shift_x, shift_y = 0.0, 0.0
+                ref_center = (cx, cy)
+            else:
                 shift_x = ref_center[0] - cx
                 shift_y = ref_center[1] - cy
-                update_shifts(shifts, base_name, cx=cx, cy=cy, shift_x=shift_x, shift_y=shift_y)
             
-            # Apply shift to full cube
+            update_shifts(shifts, base_name, cx=cx, cy=cy, shift_x=shift_x, shift_y=shift_y)
+            
+            # Apply shifts to full cube
             full_cube = load_fits(file_path, mode="full")
             aligned_cube = np.zeros_like(full_cube)
-            for i in range(full_cube.shape[0]):
-                aligned_cube[i] = transform_image(full_cube[i], shift_x, shift_y)
+            for j in range(full_cube.shape[0]):
+                aligned_cube[j] = transform_image(full_cube[j], shift_x, shift_y)
             
             # Save results
             saved_path = save_processed(
@@ -433,40 +659,20 @@ def spatial_calibration(
                 {
                     'SPATIAL': ('CALIBRATED', 'Spatial calibration applied'),
                     'SHIFT_X': (shift_x, 'X shift (pixels)'),
-                    'SHIFT_Y': (shift_y, 'Y shift (pixels)')
+                    'SHIFT_Y': (shift_y, 'Y shift (pixels)'),
+                    'DET_RADIUS': (radius, 'Detected circle radius')
                 }
             )
             aligned_files.append(saved_path)
+            
+            logger.info(f"Processed {file}: center=({cx:.1f},{cy:.1f}), radius={radius:.1f}")
             
         except Exception as e:
             logger.error(f"Failed to process {file}: {str(e)}")
             continue
 
     save_shifts(shifts, os.path.join(folder_path, "shifts.csv"))
-
-    # Plot original spectra
-    original_spectra = []
-    for file in files:
-        try:
-            # Get spectrum from center region
-            result = process_spectrum(
-                os.path.join(folder_path, file),
-                shifts,
-                region_size=100,
-                percentage=1
-            )
-            if result:
-                original_spectra.append(result)
-        except Exception as e:
-            logger.error(f"Couldn't process {file} for plotting: {str(e)}")
-    
-    if original_spectra:
-        plot_spectra(
-            original_spectra,
-            "Original Spectra (Spatially Aligned)",
-            os.path.join(folder_path, "plots", "spatial_alignment_spectra.png")
-        )
-
+    logger.info(f"Calibration complete. Reference radius: {reference_radius} pixels")
     return aligned_files
 
 def wavelength_calibration(
@@ -474,13 +680,20 @@ def wavelength_calibration(
     shifts: Dict[str, Tuple],
     region_size: int = 100,
     percentage: float = 1,
-    max_workers: int = 4
+    max_workers: int = 4,
+    mode: str = "fe_only"  # Can be "fe_only" or "all_files"
 ) -> List[str]:
-    """Align spectra in wavelength space"""
-    logger.info("Starting wavelength calibration...")
+    """Align spectra in wavelength space with mode selection"""
+    logger.info(f"Starting wavelength calibration in {mode} mode...")
     
     spatial_folder = os.path.join(folder_path, "AlignedImages", "Spatial")
-    files = [os.path.join(spatial_folder, f) for f in os.listdir(spatial_folder) if f.endswith('_aligned.fits')]
+    if mode == "fe_only":
+        files = [os.path.join(spatial_folder, f) for f in os.listdir(spatial_folder) 
+                if f.endswith('_aligned.fits') and '_FE' in f]
+    else:
+        files = [os.path.join(spatial_folder, f) for f in os.listdir(spatial_folder) 
+                if f.endswith('_aligned.fits')]
+
     if not files:
         raise ValueError("No spatially aligned files found")
 
@@ -576,13 +789,20 @@ def intensity_calibration(
     shifts: Dict[str, Tuple],
     region_size: int = 100,
     percentage: float = 1,
-    max_workers: int = 4
+    max_workers: int = 4,
+    mode: str = "fe_only"  # Can be "fe_only" or "all_files"
 ) -> List[str]:
-    """Normalize intensities across all spectra"""
-    logger.info("Starting intensity calibration...")
+    """Normalize intensities with mode selection"""
+    logger.info(f"Starting intensity calibration in {mode} mode...")
     
-    wave_folder = os.path.join(folder_path, "AlignedImages", "Wavelength")
-    files = [os.path.join(wave_folder, f) for f in os.listdir(wave_folder) if f.endswith('_wave.fits')]
+    wavelength_folder = os.path.join(folder_path, "AlignedImages", "Wavelength")
+    if mode == "fe_only":
+        files = [os.path.join(wavelength_folder, f) for f in os.listdir(wavelength_folder) 
+                if f.endswith('_wave.fits') and '_FE' in f]
+    else:
+        files = [os.path.join(wavelength_folder, f) for f in os.listdir(wavelength_folder) 
+                if f.endswith('_wave.fits')]
+
     if not files:
         raise ValueError("No wavelength-aligned files found")
 
@@ -663,76 +883,6 @@ def intensity_calibration(
 
     return scaled_files
 
-def apply_calibrations_to_ha_files(
-    folder_path: str,
-    shifts: Dict[str, Tuple],
-    alignment_wavelength: int = 1
-) -> List[str]:
-    """Apply existing calibrations to matching H-alpha files"""
-    logger.info("Applying calibrations to H-alpha files...")
-    
-    files = [f for f in os.listdir(folder_path) if f.endswith('_FE.fits')]
-    if not files:
-        raise ValueError("No Fe FITS files found")
-
-    processed_files = []
-    for fe_file in files:
-        fe_path = os.path.join(folder_path, fe_file)
-        ha_path = find_matching_ha_file(fe_path)
-        
-        if not ha_path or not os.path.exists(ha_path):
-            logger.warning(f"No matching H-alpha file found for {fe_file}")
-            continue
-
-        try:
-            # Get shifts from corresponding Fe file
-            base_name = os.path.splitext(os.path.basename(fe_path))[0] + '.fits'
-            current_shifts = get_shifts(shifts, base_name)
-            shift_y, shift_x, wavelength_shift, cx, cy, intensity_scaling = current_shifts
-
-            # Load H-alpha cube
-            ha_cube = load_fits(ha_path, mode="full")
-            
-            # Apply spatial shift
-            aligned_cube = np.zeros_like(ha_cube)
-            for i in range(ha_cube.shape[0]):
-                aligned_cube[i] = transform_image(ha_cube[i], shift_x, shift_y)
-            
-            # Apply wavelength shift if needed (for 3D cubes)
-            if wavelength_shift != 0 and aligned_cube.ndim == 3:
-                aligned_cube = np.roll(aligned_cube, wavelength_shift, axis=0)
-                if wavelength_shift < 0:
-                    aligned_cube[wavelength_shift:] = 0
-                elif wavelength_shift > 0:
-                    aligned_cube[:wavelength_shift] = 0
-            
-            # Apply intensity scaling
-            scaled_cube = aligned_cube * intensity_scaling
-            
-            # Save processed H-alpha file
-            saved_path = save_processed(
-                ha_path,
-                folder_path,
-                "spatial",
-                scaled_cube,
-                "_aligned",
-                {
-                    'SPATIAL': ('CALIBRATED', 'Spatial calibration applied'),
-                    'SHIFT_X': (shift_x, 'X shift (pixels)'),
-                    'SHIFT_Y': (shift_y, 'Y shift (pixels)'),
-                    'WAVESHFT': (wavelength_shift, 'Wavelength shift'),
-                    'SCALE_FC': (intensity_scaling, 'Intensity scaling factor'),
-                    'REF_FILE': (fe_file, 'Reference Fe file')
-                }
-            )
-            processed_files.append(saved_path)
-            
-        except Exception as e:
-            logger.error(f"Failed to process {ha_path}: {str(e)}")
-            continue
-
-    return processed_files
-
 if __name__ == "__main__":
     try:
         folder_path = "TestImages"
@@ -745,32 +895,40 @@ if __name__ == "__main__":
         # Load or initialize shifts
         shifts = load_shifts(shifts_file)
         
-        # Run full calibration pipeline on Fe files
+        # First run: Calibrate only Fe files
+        logger.info("=== CALIBRATING Fe FILES ===")
         spatial_results = spatial_calibration(
             folder_path,
             shifts,
             alignment_wavelength=40,
             reference_index=0,
-            min_radius=900,
-            max_radius=950
+            mode="fe_only"
         )
         
         wavelength_results = wavelength_calibration(
             folder_path,
             shifts,
             region_size=100,
-            percentage=1
+            percentage=1,
+            mode="fe_only"
         )
         
         intensity_results = intensity_calibration(
             folder_path,
             shifts,
             region_size=100,
-            percentage=1
+            percentage=1,
+            mode="fe_only"
         )
         
-        # Apply calibrations to matching H-alpha files
-        ha_results = apply_calibrations_to_ha_files(folder_path, shifts)
+        # Second run: Apply calibrations to H-alpha files with plotting
+        logger.info("=== APPLYING TO H-alpha FILES ===")
+        ha_results = apply_calibrations_to_ha_files(
+            folder_path,
+            shifts,
+            alignment_wavelength=40,
+            plot_spectra=True
+        )
         
         logger.info("Calibration completed successfully")
         

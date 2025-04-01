@@ -183,6 +183,7 @@ def save_processed(
     logger.info(f"Saved {output_type} data to {output_path}")
     return output_path
 
+
 # Image Processing Functions
 def preprocess_image(image: np.ndarray, sigma: float = 2) -> np.ndarray:
     """Prepare image for circle detection"""
@@ -367,14 +368,20 @@ def spatial_calibration(
     alignment_wavelength: int = 1,
     reference_index: int = 0,
     min_radius: int = 800,
-    max_radius: int = 1000
+    max_radius: int = 1000,
+    mode: str = "fe_only"  # Can be "fe_only" or "all_files"
 ) -> List[str]:
-    """Perform spatial alignment of all images"""
-    logger.info("Starting spatial calibration...")
+    """Perform spatial alignment of images with mode selection"""
+    logger.info(f"Starting spatial calibration in {mode} mode...")
     
-    files = [f for f in os.listdir(folder_path) if f.lower().endswith('.fits')]
+    # Get files based on mode
+    if mode == "fe_only":
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith('_fe.fits')]
+    else:  # "all_files"
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith('.fits')]
+    
     if not files:
-        raise ValueError("No FITS files found")
+        raise ValueError("No FITS files found matching mode criteria")
     if reference_index >= len(files):
         raise ValueError("Invalid reference index")
 
@@ -466,13 +473,20 @@ def wavelength_calibration(
     shifts: Dict[str, Tuple],
     region_size: int = 100,
     percentage: float = 1,
-    max_workers: int = 4
+    max_workers: int = 4,
+    mode: str = "fe_only"  # Can be "fe_only" or "all_files"
 ) -> List[str]:
-    """Align spectra in wavelength space"""
-    logger.info("Starting wavelength calibration...")
+    """Align spectra in wavelength space with mode selection"""
+    logger.info(f"Starting wavelength calibration in {mode} mode...")
     
     spatial_folder = os.path.join(folder_path, "AlignedImages", "Spatial")
-    files = [os.path.join(spatial_folder, f) for f in os.listdir(spatial_folder) if f.endswith('_aligned.fits')]
+    if mode == "fe_only":
+        files = [os.path.join(spatial_folder, f) for f in os.listdir(spatial_folder) 
+                if f.endswith('_aligned.fits') and '_FE' in f]
+    else:
+        files = [os.path.join(spatial_folder, f) for f in os.listdir(spatial_folder) 
+                if f.endswith('_aligned.fits')]
+
     if not files:
         raise ValueError("No spatially aligned files found")
 
@@ -568,13 +582,20 @@ def intensity_calibration(
     shifts: Dict[str, Tuple],
     region_size: int = 100,
     percentage: float = 1,
-    max_workers: int = 4
+    max_workers: int = 4,
+    mode: str = "fe_only"  # Can be "fe_only" or "all_files"
 ) -> List[str]:
-    """Normalize intensities across all spectra"""
-    logger.info("Starting intensity calibration...")
+    """Normalize intensities with mode selection"""
+    logger.info(f"Starting intensity calibration in {mode} mode...")
     
-    wave_folder = os.path.join(folder_path, "AlignedImages", "Wavelength")
-    files = [os.path.join(wave_folder, f) for f in os.listdir(wave_folder) if f.endswith('_wave.fits')]
+    wavelength_folder = os.path.join(folder_path, "AlignedImages", "Wavelength")
+    if mode == "fe_only":
+        files = [os.path.join(wavelength_folder, f) for f in os.listdir(wavelength_folder) 
+                if f.endswith('_wave.fits') and '_FE' in f]
+    else:
+        files = [os.path.join(wavelength_folder, f) for f in os.listdir(wavelength_folder) 
+                if f.endswith('_wave.fits')]
+
     if not files:
         raise ValueError("No wavelength-aligned files found")
 
@@ -655,7 +676,6 @@ def intensity_calibration(
 
     return scaled_files
 
-# Example usage
 if __name__ == "__main__":
     try:
         folder_path = "TestImages"
@@ -668,29 +688,40 @@ if __name__ == "__main__":
         # Load or initialize shifts
         shifts = load_shifts(shifts_file)
         
-        # Run full calibration pipeline
+        # First run: Calibrate only Fe files
+        logger.info("=== CALIBRATING Fe FILES ===")
         spatial_results = spatial_calibration(
             folder_path,
             shifts,
             alignment_wavelength=40,
             reference_index=0,
             min_radius=900,
-            max_radius=950
+            max_radius=950,
+            mode="fe_only"
         )
         
         wavelength_results = wavelength_calibration(
             folder_path,
             shifts,
             region_size=100,
-            percentage=1
+            percentage=1,
+            mode="fe_only"
         )
         
         intensity_results = intensity_calibration(
             folder_path,
             shifts,
             region_size=100,
-            percentage=1
+            percentage=1,
+            mode="fe_only"
         )
+        
+        # Second run: Apply calibrations to H-alpha files
+        logger.info("=== APPLYING TO H-alpha FILES ===")
+        ha_results = apply_calibrations_to_ha_files(folder_path, shifts)
+        
+        # Optional: Run calibration on all files (including H-alpha) if needed
+        # spatial_results_all = spatial_calibration(..., mode="all_files")
         
         logger.info("Calibration completed successfully")
         
